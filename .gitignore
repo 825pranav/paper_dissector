@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Caches
+.cache/
+.streamlit/
+
+# Test artefacts
+test.pdf
+*.log
