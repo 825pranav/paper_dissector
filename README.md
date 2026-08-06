@@ -57,23 +57,49 @@ Parsing a 15-page paper takes ~25 s on CPU after that.
 |-----|---------|--------|
 | `GEMINI_API_KEY` | **Required** — extractor, auditor, visual verifier, judge | https://aistudio.google.com/apikey |
 | `GROQ_API_KEY` | **Required** — evidence hunter, prosecutor, defender | https://console.groq.com/keys |
-| `SEMANTIC_SCHOLAR_API_KEY` | **Strongly recommended** | https://www.semanticscholar.org/product/api |
+| `SEMANTIC_SCHOLAR_API_KEY` | Optional | https://www.semanticscholar.org/product/api |
 | `HF_API_KEY` | Optional | https://huggingface.co/settings/tokens |
 
-Two things worth knowing before you fill these in:
+Only the two LLM keys are required. Both are self-serve and free.
 
-- **Semantic Scholar without a key is effectively unusable.** The unauthenticated
-  `/paper/search` pool is shared across all users and returns HTTP 429 on nearly
-  every call. The pipeline degrades gracefully — a circuit breaker stops retrying
-  and the stage reports no papers found rather than crashing — but you lose the
-  external-evidence half of the analysis.
-- **Do not put a trailing `# comment` on the same line as a value in `.env`.**
-  `python-dotenv` keeps it as part of the value, so the key becomes the literal
-  comment text and you get confusing auth errors instead of a clear one.
+**Do not put a trailing `# comment` on the same line as a value in `.env`.**
+`python-dotenv` keeps it as part of the value, so the key becomes the literal
+comment text and you get confusing auth errors instead of a clear one.
 
-`HF_API_KEY` is genuinely optional: if HuggingFace inference is missing, rate
-limited, or returns an unexpected payload, stance classification falls back to a
-batched LLM call automatically.
+`HF_API_KEY` is optional: if HuggingFace inference is missing, rate limited, or
+returns an unexpected payload, stance classification falls back to a batched LLM
+call automatically.
+
+### Literature backend
+
+Literature search goes through `tools/literature.py`, which picks a backend
+from `LITERATURE_PROVIDER`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` (default) | Semantic Scholar if `SEMANTIC_SCHOLAR_API_KEY` is set, else OpenAlex |
+| `openalex` | Always OpenAlex |
+| `semantic_scholar` | Always Semantic Scholar |
+
+**OpenAlex is the default because it needs no key.** Semantic Scholar's
+unauthenticated `/paper/search` pool is shared across all users and returns HTTP
+429 on essentially every call, so a keyless S2 setup finds nothing. An S2 key
+lifts that, but it is granted through an application form rather than instantly.
+
+Both backends return records in the same shape, so nothing downstream changes.
+If the active backend returns no results, the keyless one is tried as a fallback.
+
+Set `OPENALEX_MAILTO` to a contact address to use OpenAlex's faster "polite
+pool". It is opt-in and left empty by default — nothing is sent unless you set it.
+
+Two OpenAlex quirks the code compensates for, both found in testing:
+
+- It stores several records per paper, including reindexed preprints dated years
+  after the original. Title lookup therefore takes the *earliest* matching
+  record, and a catalogue year later than the newest year in the paper's own
+  text is rejected in favour of that bound.
+- Duplicate records share a DOI but differ by id, so retrieved papers are
+  deduplicated on DOI rather than the provider's id.
 
 ### Windows note
 
@@ -130,8 +156,9 @@ python -c "from paper_dissector import cache; cache.clear()"
 The pipeline is built to finish on flaky free tiers rather than crash:
 
 - Every external call retries with exponential backoff (tenacity).
-- Semantic Scholar has a circuit breaker — after repeated failures it stops
-  calling out for a cooldown instead of burning minutes on retries.
+- Each literature backend has a circuit breaker — after repeated failures it
+  stops calling out for a cooldown instead of burning minutes on retries.
+  Measured: six rate-limited queries take ~26s instead of ~200s.
 - A failure on one claim degrades that claim only; the remaining claims continue.
 - If a provider rejects `response_format={"type": "json_object"}`, the LLM layer
   detects it once and switches that provider to prompt-based JSON with tolerant
@@ -162,9 +189,23 @@ paper-dissector/
 │   │   └── judge.py                # Stage 6: verdict adjudication
 │   └── tools/
 │       ├── pdf_parser.py           # Docling PDF → markdown + figures
-│       ├── semantic_scholar.py     # Semantic Scholar API client
-│       └── stance_classifier.py    # HuggingFace DeBERTa-v3 NLI
+│       ├── literature.py           # Backend-agnostic literature search
+│       ├── openalex.py             # OpenAlex client (keyless, the default)
+│       ├── semantic_scholar.py     # Semantic Scholar client
+│       ├── _http.py                # Shared throttle/retry/cache/circuit breaker
+│       └── stance_classifier.py    # HuggingFace DeBERTa-v3 NLI + LLM fallback
+└── tests/
+    └── test_offline.py             # Regression checks needing no keys or network
 ```
+
+## Tests
+
+```bash
+python tests/test_offline.py        # or: python -m pytest tests/ -q
+```
+
+31 checks covering JSON coercion, claim dedup, figure matching, convergence
+detection, year resolution and verdict banding. No keys, no network.
 
 ## Evaluation
 

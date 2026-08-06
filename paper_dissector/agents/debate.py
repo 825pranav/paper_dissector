@@ -17,7 +17,7 @@ from paper_dissector.schemas import (
     ExternalEvidenceResult, InternalAuditResult,
 )
 from paper_dissector.state import PaperState
-from paper_dissector.tools.semantic_scholar import search_papers
+from paper_dissector.tools.literature import search_papers
 
 log = logging.getLogger(__name__)
 

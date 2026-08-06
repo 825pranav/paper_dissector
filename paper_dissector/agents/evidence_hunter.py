@@ -10,7 +10,7 @@ from paper_dissector.schemas import (
     Claim, ExternalEvidenceResult, RetrievedPaper, Stance, StalenessEntry,
 )
 from paper_dissector.state import PaperState
-from paper_dissector.tools.semantic_scholar import search_papers, search_sota_for_task
+from paper_dissector.tools.literature import search_papers, search_sota_for_task
 from paper_dissector.tools.stance_classifier import batch_classify
 
 log = logging.getLogger(__name__)
@@ -63,18 +63,37 @@ def _generate_queries(claim: Claim) -> list[str]:
     return queries[:MAX_QUERIES_PER_CLAIM]
 
 
+def _dedupe_key(paper: dict) -> str:
+    """
+    Identity for a retrieved paper, stable across backends.
+
+    A DOI is preferred: OpenAlex in particular stores reindexed duplicates of the
+    same work under different IDs but the same DOI, so deduplicating on the
+    provider's own id alone lets the same paper through twice.
+    """
+    doi = (paper.get("externalIds") or {}).get("DOI")
+    if doi:
+        return f"doi:{str(doi).strip().lower()}"
+    title = " ".join((paper.get("title") or "").lower().split())
+    if title:
+        return f"title:{title}"
+    return f"id:{paper.get('paperId', '')}"
+
+
 def _retrieve_and_classify(claim: Claim, queries: list[str]) -> tuple[list[RetrievedPaper], list[RetrievedPaper], list[RetrievedPaper]]:
     """Search Semantic Scholar and classify stance of retrieved papers."""
     supporting, contradicting, neutral = [], [], []
-    seen_ids = set()
+    seen: set[str] = set()
     candidates: list[dict] = []
 
     for query in queries:
         for p in search_papers(query, limit=5):
-            pid = p.get("paperId", "")
-            if not pid or pid in seen_ids or not p.get("abstract"):
+            if not p.get("abstract"):
                 continue
-            seen_ids.add(pid)
+            key = _dedupe_key(p)
+            if not key or key in seen:
+                continue
+            seen.add(key)
             candidates.append(p)
         if len(candidates) >= MAX_PAPERS_PER_CLAIM:
             break

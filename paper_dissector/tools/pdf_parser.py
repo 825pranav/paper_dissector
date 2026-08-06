@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import datetime
 import io
 import logging
 import re
@@ -18,8 +19,20 @@ log = logging.getLogger(__name__)
 # pipeline produces markdown with no bitmaps at all.
 IMAGE_SCALE = 2.0
 
-_YEAR_RE = re.compile(r"\b(19[89]\d|20[0-4]\d)\b")
+_MIN_YEAR = 1980
+_MAX_YEAR = datetime.date.today().year + 1
+# Deliberately narrow: a wider range matches model hyperparameters, notably the
+# d_ff = 2048 that appears in most transformer papers.
+_YEAR_RE = re.compile(r"\b(19[89]\d|20[0-2]\d)\b")
 _FIGNUM_RE = re.compile(r"\b(?:figure|fig\.?|table|tab\.?)\s*([0-9]+|[ivxlc]+)\b", re.IGNORECASE)
+
+
+def _plausible_years(text: str) -> list[int]:
+    """Years in the text that could plausibly be publication dates."""
+    return [
+        y for y in (int(m) for m in _YEAR_RE.findall(text))
+        if _MIN_YEAR <= y <= _MAX_YEAR
+    ]
 
 
 def _build_converter() -> DocumentConverter:
@@ -161,7 +174,7 @@ def extract_year(markdown: str, title: str = "", doc=None) -> int | None:
         value = getattr(origin, attr, None) if origin is not None else None
         if value is not None:
             year = getattr(value, "year", None)
-            if isinstance(year, int) and 1980 <= year <= 2049:
+            if isinstance(year, int) and _MIN_YEAR <= year <= _MAX_YEAR:
                 return year
             match = _YEAR_RE.search(str(value))
             if match:
@@ -170,30 +183,43 @@ def extract_year(markdown: str, title: str = "", doc=None) -> int | None:
     # 2. Lines that state the paper's own date. These outrank anything inferred.
     head = markdown[:4000]
     for pattern in (
-        r"(?:published|submitted|accepted|revised)[^\n]{0,40}?\b(19[89]\d|20[0-4]\d)\b",
-        r"\barxiv:[^\n]{0,60}?\b(19[89]\d|20[0-4]\d)\b",
-        r"(?:©|\(c\)|copyright)\s*(19[89]\d|20[0-4]\d)\b",
+        r"(?:published|submitted|accepted|revised)[^\n]{0,40}?\b(19[89]\d|20[0-2]\d)\b",
+        r"\barxiv:[^\n]{0,60}?\b(19[89]\d|20[0-2]\d)\b",
+        r"(?:©|\(c\)|copyright)\s*(19[89]\d|20[0-2]\d)\b",
     ):
         match = re.search(pattern, head, re.IGNORECASE)
         if match:
             return int(match.group(1))
 
-    # 3. Ask Semantic Scholar about the title. This beats scraping a year out of
+    # A paper cannot mention a year later than its own publication, so the
+    # latest year anywhere in the text bounds any externally looked-up date.
+    # Catalogues carry reindexed records dated years after the original.
+    text_years = _plausible_years(markdown)
+    upper_bound = max(text_years) if text_years else None
+
+    # 3. Ask the literature backend about the title. This beats scraping a year out of
     #    the body, where the first "(YYYY)" is usually a citation rather than the
     #    paper's own date.
     if title:
         try:
-            from paper_dissector.tools.semantic_scholar import lookup_paper_by_title
+            from paper_dissector.tools.literature import lookup_paper_by_title
 
             record = lookup_paper_by_title(title)
             year = (record or {}).get("year")
-            if isinstance(year, int) and 1980 <= year <= 2049:
+            if isinstance(year, int) and _MIN_YEAR <= year <= _MAX_YEAR:
+                if upper_bound is not None and year > upper_bound:
+                    log.info(
+                        "catalogue year %d for %r postdates the newest year in the "
+                        "paper text (%d); using the text bound instead",
+                        year, title[:60], upper_bound,
+                    )
+                    return upper_bound
                 return year
         except Exception as exc:
-            log.debug("Semantic Scholar year lookup failed: %s", exc)
+            log.debug("literature year lookup failed: %s", exc)
 
     # 4. Last resort: the most recent plausible year in the header block.
-    years = [int(y) for y in _YEAR_RE.findall(head)]
+    years = _plausible_years(head)
     if years:
         log.info("falling back to a year scraped from the paper text; may be a citation")
         return max(years)

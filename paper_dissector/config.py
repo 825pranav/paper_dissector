@@ -92,6 +92,27 @@ def get_client_for_agent(agent_name: str) -> tuple[OpenAI, str]:
 SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
 SEMANTIC_SCHOLAR_BASE = "https://api.semanticscholar.org/graph/v1"
 
+# ── Literature source ────────────────────────────────────────────
+# "auto" uses Semantic Scholar when a key is present and OpenAlex otherwise.
+# OpenAlex needs no key; Semantic Scholar's unauthenticated search pool is
+# shared across all users and returns 429 on essentially every call.
+LITERATURE_PROVIDER = os.getenv("LITERATURE_PROVIDER", "auto").strip().lower()
+
+OPENALEX_BASE = os.getenv("OPENALEX_BASE", "https://api.openalex.org")
+# Supplying a contact address moves you to OpenAlex's faster "polite pool".
+# Opt-in only - left empty we use the shared common pool.
+OPENALEX_MAILTO = os.getenv("OPENALEX_MAILTO", "").strip()
+
+
+def resolve_literature_provider() -> str:
+    """Which literature backend to use: 'semantic_scholar' or 'openalex'."""
+    if LITERATURE_PROVIDER in ("semantic_scholar", "s2"):
+        return "semantic_scholar"
+    if LITERATURE_PROVIDER == "openalex":
+        return "openalex"
+    return "semantic_scholar" if SEMANTIC_SCHOLAR_API_KEY else "openalex"
+
+
 HF_API_KEY = os.getenv("HF_API_KEY", "")
 # The legacy api-inference.huggingface.co host is being retired in favour of the
 # router; override via .env if your account still uses the old endpoint.
