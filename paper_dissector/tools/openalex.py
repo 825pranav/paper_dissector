@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import os
 
-from paper_dissector.config import OPENALEX_BASE, OPENALEX_MAILTO
+from paper_dissector.config import OPENALEX_API_KEY, OPENALEX_BASE, OPENALEX_MAILTO
 from paper_dissector.tools._http import ResilientJSONClient
 
 log = logging.getLogger(__name__)
@@ -31,8 +31,14 @@ _client = ResilientJSONClient(
     name="openalex",
     base_url=OPENALEX_BASE,
     headers=_headers,
-    min_interval=float(os.getenv("OPENALEX_MIN_INTERVAL", "0.2")),
+    # OpenAlex throttles bursts, so space requests out. Give up quickly though:
+    # when it pauses anonymous search there is a working fallback behind us in
+    # the chain, and grinding through retries just delays reaching it.
+    min_interval=float(os.getenv("OPENALEX_MIN_INTERVAL", "1.1")),
     timeout=float(os.getenv("OPENALEX_TIMEOUT", "30")),
+    max_attempts=int(os.getenv("OPENALEX_MAX_ATTEMPTS", "2")),
+    failure_threshold=int(os.getenv("OPENALEX_FAILURE_THRESHOLD", "2")),
+    cooldown=float(os.getenv("OPENALEX_COOLDOWN", "90")),
 )
 
 
@@ -40,6 +46,10 @@ def _base_params() -> dict:
     params = {"select": _SELECT}
     if OPENALEX_MAILTO:
         params["mailto"] = OPENALEX_MAILTO
+    if OPENALEX_API_KEY:
+        # A key exempts us from the anonymous-search pause OpenAlex applies
+        # when its search cluster is under load.
+        params["api_key"] = OPENALEX_API_KEY
     return params
 
 

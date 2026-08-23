@@ -12,19 +12,55 @@ PDF → Docling Parser → Claim Extractor → Internal Auditor (+ VLM figure ch
     → Judge → Credibility Report
 ```
 
-**6 specialized agents**, each using the best free LLM for their role:
+**Nine agent roles**, each mapped to the free model that suits it — chosen against measured free-tier limits rather than model prestige:
 
-| Agent | Provider | Model |
-|-------|----------|-------|
-| Claim Extractor | Google AI Studio | Gemini 2.5 Flash |
-| Internal Auditor | Google AI Studio | Gemini 2.5 Flash |
-| Visual Verifier | Google AI Studio | Gemini 2.5 Flash (vision) |
-| Evidence Hunter | Groq | Llama 3.3 70B |
-| Prosecutor | Groq | Llama 3.3 70B |
-| Defender | Groq | Llama 3.3 70B |
-| Judge | Google AI Studio | Gemini 2.5 Flash |
+| Agent | Provider | Model | Why |
+|-------|----------|-------|-----|
+| Claim Extractor | Google AI Studio | Gemini 3.6 Flash | Only call that must see the whole paper |
+| Internal Auditor | Groq | gpt-oss-120b | Reasoning over targeted excerpts |
+| Visual Verifier | Google AI Studio | Gemini 3.6 Flash (vision) | Groq has no vision model |
+| Evidence Hunter | Groq | qwen3.8-27b | Native JSON mode |
+| Prosecutor | Groq | gpt-oss-120b | Strongest available reasoning |
+| Defender | Groq | gpt-oss-120b | Same model as prosecutor, so the debate is symmetric |
+| Judge | Groq | qwen3.8-27b | Different family from the debaters, so it is not grading itself |
 
-**External tools:** Semantic Scholar API, HuggingFace Inference (DeBERTa-v3 for stance classification)
+The mapping lives in one place, `AGENT_CONFIG` in `config.py`. Any single role
+can be re-pointed without touching code:
+
+```bash
+PD_AGENT_JUDGE_PROVIDER=gemini PD_AGENT_JUDGE_MODEL=gemini-3.6-flash streamlit run app.py
+```
+
+### Free-tier limits that shape this design
+
+These were measured against the live APIs, not taken from documentation, and
+they are the reason the roles are split the way they are:
+
+| Provider | Limit | Consequence |
+|----------|-------|-------------|
+| Gemini | **20 requests/day, per model** | Cannot serve a per-claim role. Used for the single whole-paper extraction call and for vision. |
+| Gemini | large context, no per-request cap | Ideal for the one call that needs all 12k tokens of the paper. |
+| Groq | **8000 tokens/minute** | A single request above this is rejected with HTTP 413, not throttled. Everything sent to Groq must stay under ~6500 tokens. |
+| Groq | 1000 requests/day | Plenty; request count is never the binding constraint. |
+
+Two consequences worth knowing:
+
+- **The auditor reads excerpts, not the paper.** `build_audit_excerpt` selects
+  the claim's own section, the tables and figures it cites, and the opening —
+  scoring blocks by relevance and keeping them in document order. On a 15-page
+  paper that is 49k chars down to about 12k. Sending the full text per claim
+  would exceed Groq's per-request ceiling outright.
+- **Every request is size-guarded.** `llm._fit_to_budget` estimates tokens and
+  trims the largest user message (never the system prompt) before sending, so an
+  unexpectedly long paper degrades to a truncated request instead of a failed
+  stage.
+
+Gemini's daily cap is per *model*, so if you exhaust one you can point a role at
+another (`gemini-3.5-flash`, `gemini-3.7-flash`, …), each with its own
+allowance. Note that `gemini-3.8-flash` is 15-30x slower and its JSON mode times
+out; `gemini-3.6-flash` is the one to use.
+
+**External tools:** OpenAlex / arXiv / Semantic Scholar for literature, HuggingFace Inference (DeBERTa-v3) for stance classification with a batched LLM fallback.
 
 ## Key Differentiators
 
@@ -55,8 +91,9 @@ Parsing a 15-page paper takes ~25 s on CPU after that.
 
 | Key | Needed? | Get it |
 |-----|---------|--------|
-| `GEMINI_API_KEY` | **Required** — extractor, auditor, visual verifier, judge | https://aistudio.google.com/apikey |
-| `GROQ_API_KEY` | **Required** — evidence hunter, prosecutor, defender | https://console.groq.com/keys |
+| `GEMINI_API_KEY` | **Required** — claim extraction and figure reading | https://aistudio.google.com/apikey |
+| `GROQ_API_KEY` | **Required** — every other role | https://console.groq.com/keys |
+| `OPENALEX_API_KEY` | Recommended, free and instant | https://openalex.org/rest-api |
 | `SEMANTIC_SCHOLAR_API_KEY` | Optional | https://www.semanticscholar.org/product/api |
 | `HF_API_KEY` | Optional | https://huggingface.co/settings/tokens |
 
@@ -78,16 +115,25 @@ from `LITERATURE_PROVIDER`:
 | Value | Behaviour |
 |-------|-----------|
 | `auto` (default) | Semantic Scholar if `SEMANTIC_SCHOLAR_API_KEY` is set, else OpenAlex |
-| `openalex` | Always OpenAlex |
-| `semantic_scholar` | Always Semantic Scholar |
+| `openalex` | Prefer OpenAlex |
+| `arxiv` | Prefer arXiv |
+| `semantic_scholar` | Prefer Semantic Scholar |
 
-**OpenAlex is the default because it needs no key.** Semantic Scholar's
-unauthenticated `/paper/search` pool is shared across all users and returns HTTP
-429 on essentially every call, so a keyless S2 setup finds nothing. An S2 key
-lifts that, but it is granted through an application form rather than instantly.
+Whatever the preference, the remaining keyless backends are tried in turn when the preferred one returns nothing, because none of the three is reliably up on its own.
 
-Both backends return records in the same shape, so nothing downstream changes.
-If the active backend returns no results, the keyless one is tried as a fallback.
+Each of the three fails in a different way, which is why the chain exists:
+
+- **Semantic Scholar** — unauthenticated `/paper/search` returns HTTP 429 on
+  essentially every call. A key fixes it but is granted by application, not
+  instantly.
+- **OpenAlex** — no key needed, good metadata, but it periodically pauses
+  *anonymous* search under load (HTTP 503, "Anonymous search is paused while
+  the search cluster recovers"). A **free, instant, self-serve API key** at
+  https://openalex.org/rest-api is exempt — set `OPENALEX_API_KEY`.
+- **arXiv** — always up and keyless, but preprints only and no citation
+  counts, so it is tried last.
+
+All three return records in the same shape, so nothing downstream changes.
 
 Set `OPENALEX_MAILTO` to a contact address to use OpenAlex's faster "polite
 pool". It is opt-in and left empty by default — nothing is sent unless you set it.
@@ -141,8 +187,29 @@ are the ones that drive runtime and free-tier quota consumption:
 | `MAX_CLAIMS` | 8 | Claims analysed per paper. The main cost/time dial. |
 | `MAX_DEBATE_ROUNDS` | 4 | Prosecutor/defender exchanges per claim. |
 | `MAX_PRAG_RETRIEVALS` | 2 | Mid-debate searches each agent may fire. |
-| `AUDIT_CONTEXT_CHARS` | 60000 | Paper text sent to the auditor per claim. |
+| `AUDIT_CONTEXT_CHARS` | 12000 | Size of the excerpt built for each claim's audit. |
+| `EXTRACTION_CONTEXT_CHARS` | 400000 | Ceiling on the paper text sent to the extractor. |
+| `EXTRACTION_CHUNK_CHARS` | 18000 | Chunk size for the fallback (small-context) extractor. |
 | `CONVERGENCE_THRESHOLD` | 0.85 | Similarity at which a circling debate stops early. |
+| `GROQ_INPUT_TOKEN_BUDGET` | 6500 | Per-request ceiling enforced before sending to Groq. |
+
+**Runtime is bounded by Groq's per-minute token ceiling, not by model speed.**
+The models answer in 0.3-2s; everything else is rate-limit queueing. A measured
+run on a 15-page paper, 4 claims at 3 debate rounds, took 18 minutes:
+
+| Stage | Time | Note |
+|-------|------|------|
+| ingest | 44s | Docling, CPU |
+| extract_claims | 147s | via the chunked fallback; ~20s when Gemini quota is available |
+| internal_audit | 109s | 27s per claim |
+| external_evidence | 240s | 60s per claim, including stance classification |
+| debate | 488s | 122s per claim — the dominant cost, and it grows with rounds |
+| adjudicate | 64s | |
+
+Debate cost scales with `MAX_DEBATE_ROUNDS` times `MAX_CLAIMS`, and each round
+carries the transcript so far, so context grows within a claim. For a quick
+demonstration use `MAX_CLAIMS=2 MAX_DEBATE_ROUNDS=2`. A paid Groq tier removes
+the ceiling; nothing about the code changes.
 
 External API responses are cached on disk under `.cache/`, so repeated runs
 during development do not re-hit rate limits. Clear it with:

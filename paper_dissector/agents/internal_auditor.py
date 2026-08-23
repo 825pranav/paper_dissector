@@ -108,14 +108,117 @@ def match_figures_for_claim(claim: Claim, figures: list[dict]) -> list[dict]:
 
 # ── Audit steps ──────────────────────────────────────────────────
 
+def _split_blocks(markdown: str) -> list[str]:
+    """Split the paper into heading-delimited blocks."""
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in markdown.splitlines():
+        if line.lstrip().startswith("#") and current:
+            blocks.append("\n".join(current).strip())
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current).strip())
+    return [b for b in blocks if b]
+
+
+def _score_block(block: str, claim: Claim, refs: list[str]) -> int:
+    """How relevant a block is to auditing this claim. Higher is better."""
+    lowered = block.lower()
+    score = 0
+
+    # The block quoting the claim is the single most useful piece of evidence.
+    snippet = " ".join(claim.raw_text.lower().split())[:90]
+    if snippet and snippet in " ".join(lowered.split()):
+        score += 100
+
+    # Blocks holding a figure/table the claim cites.
+    for ref in refs:
+        kind, _, number = ref.partition(":")
+        if re.search(rf"\b{kind}s?\.?\s*{re.escape(number)}\b", lowered):
+            score += 40
+
+    # The section the claim says it came from.
+    section = (claim.source_section or "").lower()
+    if section and section not in ("unspecified", "n/a"):
+        for token in re.findall(r"[0-9]+(?:\.[0-9]+)*|[a-z]{4,}", section):
+            if token in lowered:
+                score += 8
+
+    # Tables are where reported numbers live.
+    if block.count("|") > 6:
+        score += 15
+
+    if claim.reported_value is not None and str(claim.reported_value).lower() in lowered:
+        score += 30
+    if claim.metric and claim.metric.lower() in lowered:
+        score += 10
+    if claim.baseline and claim.baseline.lower() in lowered:
+        score += 10
+
+    # Statistical reporting is one of the five checks the auditor must make.
+    if re.search(r"\bp\s*[<=>]\s*0?\.\d|confidence interval|std|significan", lowered):
+        score += 6
+
+    return score
+
+
+def build_audit_excerpt(claim: Claim, markdown: str, max_chars: int = AUDIT_CONTEXT_CHARS) -> str:
+    """
+    Assemble the slice of the paper needed to audit one claim.
+
+    Sending the whole paper per claim is both slow and impossible on Groq's free
+    tier, where any single request above ~8000 tokens is rejected outright. The
+    auditor only needs the claim's own section, the tables and figures it cites,
+    and the paper's opening for context — so select those by relevance.
+    """
+    if not markdown:
+        return ""
+    if len(markdown) <= max_chars:
+        return markdown
+
+    refs = _claim_figure_refs(claim)
+    blocks = _split_blocks(markdown)
+    if not blocks:
+        return markdown[:max_chars]
+
+    ranked = sorted(
+        ((_score_block(b, claim, refs), i, b) for i, b in enumerate(blocks)),
+        key=lambda t: (-t[0], t[1]),
+    )
+
+    # Always lead with the opening block (title/abstract) for context.
+    chosen: dict[int, str] = {0: blocks[0]}
+    used = len(blocks[0])
+
+    for score, index, block in ranked:
+        if score <= 0 or index in chosen:
+            continue
+        if used + len(block) > max_chars:
+            remaining = max_chars - used
+            if remaining > 600:      # a fragment this size is still informative
+                chosen[index] = block[:remaining]
+                used = max_chars
+            continue
+        chosen[index] = block
+        used += len(block)
+
+    # Restore document order so the auditor reads a coherent excerpt.
+    ordered = [chosen[i] for i in sorted(chosen)]
+    return "\n\n[...]\n\n".join(ordered)
+
+
 def _audit_claim_text(claim: Claim, markdown: str) -> dict:
     """Audit a claim against the paper text."""
+    excerpt = build_audit_excerpt(claim, markdown, AUDIT_CONTEXT_CHARS)
     return chat_json(
         "internal_auditor",
         AUDIT_SYSTEM_PROMPT,
         (
             f"CLAIM TO AUDIT:\n{claim.model_dump_json(indent=2)}\n\n"
-            f"FULL PAPER TEXT:\n{markdown[:AUDIT_CONTEXT_CHARS]}"
+            f"RELEVANT PAPER EXCERPTS (non-contiguous sections are separated by [...]):\n"
+            f"{excerpt}"
         ),
         temperature=0.1,
     )

@@ -19,10 +19,12 @@ from paper_dissector.agents.debate import (
     _cited_evidence, _extract_search_query, argument_similarity,
 )
 from paper_dissector.agents.evidence_hunter import _dedupe_key, _staleness_score
-from paper_dissector.agents.internal_auditor import match_figures_for_claim
+from paper_dissector.agents.internal_auditor import build_audit_excerpt, match_figures_for_claim
 from paper_dissector.agents.judge import _build_verdict, _label_for_score
-from paper_dissector.config import CONVERGENCE_THRESHOLD
-from paper_dissector.llm import LLMJSONError, extract_json
+from paper_dissector.config import CONVERGENCE_THRESHOLD, input_token_budget
+from paper_dissector.llm import (
+    LLMJSONError, _estimate_tokens, _fit_to_budget, extract_json,
+)
 from paper_dissector.sanitize import as_bool, as_str_list, as_text, clamp01, coerce_enum
 from paper_dissector.schemas import AuditSeverity, Claim, VerdictLabel
 from paper_dissector.tools.openalex import _reconstruct_abstract, _year_filter
@@ -114,6 +116,26 @@ def test_distinct_arguments_do_not_converge():
     assert argument_similarity("", "x") == 0.0
 
 
+def test_convergence_separates_realistic_debate_turns():
+    """
+    Two arguments about one claim share its vocabulary, so similarity has to be
+    measured over content words — with stopwords included, distinct arguments
+    scored high enough to end debates on round two.
+    """
+    stale = ("The baseline is stale: ResNet-50 (2015) was superseded by ConvNeXt in 2022, "
+             "and the audit shows baseline_present=false for the claimed comparison.")
+    stale_reworded = ("The baseline is stale, because ResNet-50 from 2015 was superseded by "
+                      "ConvNeXt back in 2022, and the audit reports baseline_present=false "
+                      "for that comparison.")
+    stats = ("Statistical rigor is absent. No confidence intervals, p-values or effect sizes "
+             "are reported anywhere in Table 3, so the 0.4 point gap is indistinguishable "
+             "from noise.")
+
+    assert argument_similarity(stale, stale_reworded) > CONVERGENCE_THRESHOLD
+    # A genuinely new line of attack must leave clear headroom under the threshold.
+    assert argument_similarity(stale, stats) < 0.5
+
+
 def test_progressive_rag_query_parsing():
     assert _extract_search_query('x\nSEARCH_REQUEST: "convnext imagenet"\ny') == "convnext imagenet"
     assert _extract_search_query("just an argument") is None
@@ -152,6 +174,71 @@ def test_claim_without_a_reference_matches_nothing():
 def test_reference_in_claim_text_is_used_as_fallback():
     got = match_figures_for_claim(mkclaim("Results", "as shown in Figure 2"), FIGURES)
     assert [f["figure_id"] for f in got] == ["figure_2"]
+
+
+# ── Audit excerpting and request-size guard ──────────────────────
+
+PAPER = "\n\n".join([
+    "# A Great Paper\n\nWe present a method.",
+    "## 2 Related Work\n\n" + ("Prior work discussed at length. " * 120),
+    "## 3 Method\n\n" + ("Architecture details. " * 120),
+    "## 4 Results\n\nOur model reaches 41.8 BLEU on WMT14 EN-FR.",
+    "Table 2: BLEU scores.\n\n| Model | BLEU |\n|---|---|\n| Ours | 41.8 |\n| ConvS2S | 40.46 |",
+    "## 5 Conclusion\n\n" + ("Closing remarks. " * 120),
+])
+
+
+def _bleu_claim():
+    return mkclaim(
+        section="Section 4 / Table 2",
+        text="Our model reaches 41.8 BLEU on WMT14 EN-FR.",
+        metric="BLEU", reported_value=41.8, baseline="ConvS2S",
+    )
+
+
+def test_short_paper_is_passed_through_whole():
+    short = "# Tiny\n\nOne claim here."
+    assert build_audit_excerpt(_bleu_claim(), short, max_chars=10_000) == short
+
+
+def test_excerpt_respects_the_character_budget():
+    out = build_audit_excerpt(_bleu_claim(), PAPER, max_chars=1200)
+    assert len(out) <= 1200 + 200   # allow the "[...]" joiners
+
+
+def test_excerpt_keeps_the_cited_table_and_reported_value():
+    out = build_audit_excerpt(_bleu_claim(), PAPER, max_chars=1200)
+    assert "41.8" in out
+    assert "Table 2" in out
+    # Bulk prose the claim does not reference should be dropped first.
+    assert out.count("Prior work discussed") < PAPER.count("Prior work discussed")
+
+
+def test_request_guard_trims_only_oversized_user_content():
+    system = {"role": "system", "content": "S" * 400}
+    user = {"role": "user", "content": "U" * 80_000}
+    out = _fit_to_budget([system, user], "groq")
+    assert out[0]["content"] == system["content"]        # contract preserved
+    assert len(out[1]["content"]) < len(user["content"])
+    # Must land under the budget by the estimator's own reckoning, not a looser one.
+    assert sum(_estimate_tokens(m["content"]) for m in out) <= input_token_budget("groq")
+
+
+def test_token_estimate_is_conservative():
+    # chars/4 under-counted a real payload by ~8% and the request was rejected.
+    text = "word " * 2000
+    assert _estimate_tokens(text) > len(text) // 4
+
+
+def test_explicit_budget_overrides_the_provider_default():
+    msgs = [{"role": "user", "content": "U" * 40_000}]
+    tight = _fit_to_budget(msgs, "groq", budget=1500)
+    assert sum(_estimate_tokens(m["content"]) for m in tight) <= 1500
+
+
+def test_request_guard_leaves_small_requests_alone():
+    msgs = [{"role": "user", "content": "hi"}]
+    assert _fit_to_budget(msgs, "groq") == msgs
 
 
 # ── Claim deduplication ──────────────────────────────────────────
