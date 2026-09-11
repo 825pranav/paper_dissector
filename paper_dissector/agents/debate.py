@@ -35,8 +35,12 @@ You have access to:
 RULES:
 - Every argument MUST cite specific evidence (audit field, paper DOI, staleness entry).
 - Be precise and technical. No vague attacks.
-- You can REQUEST a search query if you need more evidence (max {max_prag} times).
-  Format: SEARCH_REQUEST: "your query here"
+- If the evidence you were given is thin, or you need a specific number or a
+  stronger baseline to make your case, GO AND FIND IT. Put this on its own line:
+  SEARCH_REQUEST: "your query here"
+  You may do this up to {max_prag} times. Using it is expected, not exceptional:
+  an argument backed by a result you retrieved is far stronger than one that
+  only reasons about the evidence already in front of you.
 - You can CONCEDE a point if the defender's rebuttal is genuinely strong.
   Format: CONCEDE: "what you're conceding and why"
 - Stay focused on the specific claim, not the paper in general.
@@ -54,8 +58,11 @@ You have access to:
 RULES:
 - Directly address each of the prosecutor's points. Don't ignore attacks.
 - Cite specific supporting papers or methodological justifications.
-- You can REQUEST a search query if you need more supporting evidence (max {max_prag} times).
-  Format: SEARCH_REQUEST: "your query here"
+- If you lack corroborating evidence for a point under attack, GO AND FIND IT.
+  Put this on its own line:
+  SEARCH_REQUEST: "your query here"
+  You may do this up to {max_prag} times. Using it is expected, not exceptional:
+  independent corroboration you retrieved is the strongest defence available.
 - You can CONCEDE a point if the prosecutor's evidence is genuinely strong.
   Format: CONCEDE: "what you're conceding and why"
 - Acknowledge limitations honestly — partial concessions build credibility.
@@ -165,13 +172,58 @@ def _has_converged(turns: list[DebateTurn], role: DebateRole) -> bool:
 
 # ── Progressive RAG ──────────────────────────────────────────────
 
+# Where a model stops stating its query and starts writing something else.
+# Observed in real runs: an HTML line break, and the model inventing its own
+# "RESULT:" section complete with fabricated citations.
+_QUERY_TERMINATORS = re.compile(
+    r"(?:<br|&lt;|&gt;|\bRESULT\s*:|\bRESULTS\s*:|\bANSWER\s*:|[}\]]|\n)",
+    re.IGNORECASE,
+)
+
+MAX_QUERY_CHARS = 120
+
+
 def _extract_search_query(response_text: str) -> str | None:
-    """Pull a SEARCH_REQUEST query out of an agent's response."""
+    """
+    Pull a SEARCH_REQUEST query out of an agent's response.
+
+    Models embed the marker in prose and markdown, so the captured text arrives
+    decorated. Three shapes seen in real runs:
+        '** "WMT14 English German bootstrap significance'
+        '“BLEU variance across seeds” &lt;br RESULT: Ott et al., ...'
+        'transformer ablation study.'
+    All of it would otherwise be sent to the search backend verbatim.
+    """
     match = _SEARCH_RE.search(response_text or "")
     if not match:
         return None
-    query = match.group(1).strip().strip('"').strip("'").strip()
-    return query[:200] or None
+
+    query = match.group(1)
+
+    # Stop at the point the model stopped stating a query.
+    cut = _QUERY_TERMINATORS.search(query)
+    if cut:
+        query = query[: cut.start()]
+
+    query = re.sub(r"<[^>]+>", " ", query)               # stray html tags
+    query = re.sub(r"&[a-z]+;", " ", query)              # html entities
+    query = query.translate(str.maketrans({             # smart punctuation
+        "“": '"', "”": '"', "‘": "'", "’": "'",
+        "‑": "-", "–": "-", "—": "-", " ": " ",
+    }))
+    query = re.sub(r"[*_`#>]+", " ", query)              # markdown emphasis
+    query = re.sub(r"[\"']", " ", query)                 # any remaining quotes
+    query = re.sub(r"\s+", " ", query).strip(" .:;,-")
+
+    if not query:
+        return None
+
+    if len(query) > MAX_QUERY_CHARS:
+        # Trim to a word boundary rather than mid-term.
+        query = query[:MAX_QUERY_CHARS].rsplit(" ", 1)[0]
+        log.debug("truncated an over-long search request")
+
+    return query or None
 
 
 def _format_results(results: list[dict]) -> str:
@@ -208,6 +260,9 @@ def _handle_progressive_rag(
     except Exception as exc:
         log.warning("progressive RAG search failed for %r: %s", query, exc)
         return response_text, None, prag_budget - 1
+
+    log.info("progressive RAG: %s searched %r mid-debate, %d result(s)",
+             agent_name, query, len(results))
 
     retrieval_info = {
         "query": query,

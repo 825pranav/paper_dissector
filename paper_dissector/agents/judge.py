@@ -14,13 +14,29 @@ from paper_dissector.state import PaperState
 
 log = logging.getLogger(__name__)
 
-# Confidence bands, highest first — shared by per-claim and overall verdicts.
+# Credibility bands, highest first. A verdict label maps to a score, and a
+# score maps back to a label, so the paper-level number and the per-claim
+# labels can never disagree.
 _BANDS: list[tuple[float, VerdictLabel]] = [
     (0.85, VerdictLabel.STRONGLY_SUPPORTED),
     (0.65, VerdictLabel.SUPPORTED),
     (0.40, VerdictLabel.PARTIALLY_SUPPORTED),
     (0.20, VerdictLabel.WEAKLY_SUPPORTED),
 ]
+
+# Representative credibility for each label — the middle of its band.
+_CREDIBILITY: dict[VerdictLabel, float] = {
+    VerdictLabel.STRONGLY_SUPPORTED: 0.93,
+    VerdictLabel.SUPPORTED: 0.75,
+    VerdictLabel.PARTIALLY_SUPPORTED: 0.52,
+    VerdictLabel.WEAKLY_SUPPORTED: 0.30,
+    VerdictLabel.NOT_SUPPORTED: 0.10,
+}
+
+
+def credibility_for(label: VerdictLabel) -> float:
+    """Credibility score implied by a verdict label."""
+    return _CREDIBILITY.get(label, 0.5)
 
 JUDGE_SYSTEM = """You are the JUDGE in a scientific claim credibility analysis.
 You have read the full adversarial debate between a Prosecutor (arguing the claim
@@ -38,12 +54,17 @@ YOUR JOB:
    - Debate argument quality: 15%
    - Statistical rigor: 10%
 
-3. Issue a verdict:
-   - STRONGLY_SUPPORTED (0.85-1.0)
-   - SUPPORTED (0.65-0.84)
-   - PARTIALLY_SUPPORTED (0.40-0.64)
-   - WEAKLY_SUPPORTED (0.20-0.39)
-   - NOT_SUPPORTED (0.0-0.19)
+3. Issue a verdict — this carries how well supported the claim is:
+   - STRONGLY_SUPPORTED  the evidence firmly establishes the claim
+   - SUPPORTED           the claim holds, with minor gaps
+   - PARTIALLY_SUPPORTED parts hold, parts do not
+   - WEAKLY_SUPPORTED    little more than suggestive
+   - NOT_SUPPORTED       the evidence does not establish the claim
+
+4. Report "confidence" separately: how certain YOU are of that verdict, from
+   0.0 to 1.0. This is NOT how good the claim is. If the evidence clearly
+   refutes the claim, the correct answer is verdict NOT_SUPPORTED with a HIGH
+   confidence, because you are certain of the refutation.
 
 Respond ONLY with valid JSON:
 {
@@ -106,6 +127,7 @@ def _build_verdict(raw: dict, claim_id: str) -> ClaimVerdict:
         claim_id=claim_id,
         verdict=verdict,
         confidence=confidence,
+        credibility=credibility_for(verdict),
         justification=as_text(raw.get("justification"), default="No justification provided."),
         flags=[f.upper().replace(" ", "_") for f in as_str_list(raw.get("flags"))],
         prosecutor_strongest=as_text(raw.get("prosecutor_strongest")),
@@ -119,7 +141,8 @@ def _degraded_verdict(claim_id: str, reason: str) -> ClaimVerdict:
     return ClaimVerdict(
         claim_id=claim_id,
         verdict=VerdictLabel.PARTIALLY_SUPPORTED,
-        confidence=0.5,
+        confidence=0.0,   # we are not confident of anything here
+        credibility=credibility_for(VerdictLabel.PARTIALLY_SUPPORTED),
         justification=f"Adjudication unavailable for this claim: {reason}",
         flags=["ADJUDICATION_FAILED"],
     )
@@ -149,7 +172,9 @@ def adjudicate(state: PaperState) -> dict:
             verdicts.append(_degraded_verdict(claim.claim_id, str(exc)[:200]))
 
     # ── Compile final report ──
-    scores = [v.confidence for v in verdicts]
+    # Aggregate credibility. Averaging confidence would mean a paper whose
+    # claims were all confidently rejected scored highly.
+    scores = [v.credibility for v in verdicts]
     avg_score = sum(scores) / len(scores) if scores else 0.0
     overall = _label_for_score(avg_score)
 
@@ -177,6 +202,6 @@ def adjudicate(state: PaperState) -> dict:
         systemic_issues=systemic,
     )
 
-    log.info("adjudicated %d claims; overall %.3f (%s)",
+    log.info("adjudicated %d claims; overall credibility %.3f (%s)",
              len(verdicts), avg_score, overall.value)
     return {"verdicts": verdicts, "final_report": report}

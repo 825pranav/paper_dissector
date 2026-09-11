@@ -104,13 +104,27 @@ def _hf_classify(claim: str, passage: str) -> tuple[Stance, float] | None:
 # ── LLM fallback path ────────────────────────────────────────────
 
 _LLM_SYSTEM = """You are a scientific stance classifier. For each numbered passage,
-decide its stance toward the CLAIM:
+decide its stance toward the CLAIM.
 
-- SUPPORT: the passage provides evidence that the claim is true
-- CONTRADICT: the passage provides evidence that the claim is false or overstated
-- NEUTRAL: the passage is about a related topic but does not bear on the claim's truth
+SUPPORT — the passage is evidence that the claim is true:
+- it reports a measurement of the same quantity that agrees with the claim
+- it independently replicates or corroborates the claimed result
+- it reports a finding that would be unlikely if the claim were false
+A passage SUPPORTS the claim even if it uses different wording, reports a
+slightly different number in the same direction, or never cites the claim's
+authors. Independent corroboration is the strongest kind of support.
 
-Be strict — topical similarity alone is NEUTRAL, not SUPPORT.
+CONTRADICT — the passage is evidence that the claim is false or overstated:
+- a failed replication, or a measurement of the same quantity that disagrees
+- a result showing the claimed effect is smaller, absent, or explained away
+
+NEUTRAL — the passage does not bear on whether the claim is true:
+- a different task, dataset, metric or population
+- merely the same research area, with no measurement relevant to the claim
+
+Judge relevance, not politeness: do not default to NEUTRAL for a passage that
+genuinely measures the same thing. Reserve NEUTRAL for passages that leave the
+claim's truth untouched.
 
 Respond ONLY with JSON:
 {"results": [{"index": 1, "stance": "SUPPORT", "confidence": 0.82}]}

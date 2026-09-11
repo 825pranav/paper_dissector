@@ -29,3 +29,6 @@ streamlit>=1.38.0
 
 # Env
 python-dotenv>=1.0.0
+
+# Tests
+pytest>=8.0.0

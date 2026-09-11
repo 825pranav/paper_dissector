@@ -1,6 +1,7 @@
 """Streamlit UI for Paper Dissector."""
 
 import logging
+import os
 import tempfile
 
 import streamlit as st
@@ -35,6 +36,10 @@ with st.sidebar:
     st.header("Upload Paper")
     uploaded = st.file_uploader("Drop a PDF", type=["pdf"])
     run_btn = st.button("🚀 Analyze", type="primary", disabled=not uploaded)
+
+    st.divider()
+    st.caption("Or reopen a previous analysis without re-running the pipeline:")
+    loaded_file = st.file_uploader("Saved analysis (JSON)", type=["json"])
 
     st.divider()
     st.markdown("**Pipeline stages:**")
@@ -74,7 +79,26 @@ def _stage_summary(node: str, update: dict) -> str:
 
 # ── Main content ─────────────────────────────────────────────────
 
-if run_btn and uploaded:
+def _load_saved_analysis():
+    """Return a previously saved analysis, from an upload or PD_ANALYSIS_JSON."""
+    from paper_dissector.report_io import load_analysis, load_analysis_json
+
+    if loaded_file is not None:
+        return load_analysis_json(loaded_file.read())
+
+    env_path = os.getenv("PD_ANALYSIS_JSON", "").strip()
+    if env_path and os.path.exists(env_path):
+        return load_analysis(env_path)
+    return None
+
+
+_preloaded = _load_saved_analysis()
+
+if _preloaded is not None:
+    result = _preloaded
+    st.info("Showing a saved analysis. Upload a PDF and press Analyze to run afresh.")
+
+elif run_btn and uploaded:
     # Save uploaded file to temp
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
         f.write(uploaded.read())
@@ -125,6 +149,10 @@ if run_btn and uploaded:
         st.exception(failed)
         st.stop()
 
+else:
+    result = None
+
+if result is not None:
     report = result.get("final_report")
     if not report:
         st.error("Pipeline failed to produce a report.")
@@ -137,12 +165,16 @@ if run_btn and uploaded:
         st.caption(", ".join(report.authors))
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Overall Score", f"{report.overall_score:.2f}")
+    col1.metric("Overall Credibility", f"{report.overall_score:.2f}")
     col2.metric("Verdict", report.overall_verdict.value.replace("_", " ").title())
     col3.metric("Claims Analyzed", report.total_claims)
 
-    strong = sum(1 for v in report.claim_verdicts if v.confidence >= 0.65)
-    col4.metric("Strong Claims", f"{strong}/{report.total_claims}")
+    # Count by verdict, not confidence: a claim can be confidently NOT_SUPPORTED.
+    strong = sum(
+        1 for v in report.claim_verdicts
+        if v.verdict.value in ("STRONGLY_SUPPORTED", "SUPPORTED")
+    )
+    col4.metric("Well-supported Claims", f"{strong}/{report.total_claims}")
 
     if report.systemic_issues:
         st.warning("**Systemic Issues Found:**\n" + "\n".join(f"- {i}" for i in report.systemic_issues))
@@ -172,9 +204,16 @@ if run_btn and uploaded:
         }
         icon = color_map.get(v.verdict.value, "⚪")
 
-        with st.expander(f"{icon} [{v.claim_id}] {claim.raw_text[:100]}... — **{v.confidence:.2f}**"):
+        with st.expander(
+            f"{icon} [{v.claim_id}] {claim.raw_text[:100]}... — "
+            f"**{v.verdict.value.replace('_', ' ').title()}**"
+        ):
             st.markdown(f"**Verdict:** {v.verdict.value.replace('_', ' ').title()}")
-            st.markdown(f"**Confidence:** {v.confidence:.2f}")
+            st.markdown(
+                f"**Credibility:** {v.credibility:.2f} &nbsp;|&nbsp; "
+                f"**Judge's confidence in this verdict:** {v.confidence:.2f}",
+                unsafe_allow_html=True,
+            )
             st.markdown(f"**Justification:** {v.justification}")
 
             if v.flags:
@@ -286,11 +325,23 @@ if run_btn and uploaded:
                 st.markdown(f"**❓ Unresolved:** {', '.join(v.unresolved)}")
 
     st.divider()
-    st.download_button(
-        "⬇️ Download full report (JSON)",
+    from paper_dissector.report_io import to_json
+
+    col_a, col_b = st.columns(2)
+    col_a.download_button(
+        "⬇️ Download verdicts (JSON)",
         data=report.model_dump_json(indent=2),
         file_name="paper_dissector_report.json",
         mime="application/json",
+    )
+    # The full analysis can be reloaded in the sidebar, so a run never has to
+    # be repeated just to look at it again.
+    col_b.download_button(
+        "⬇️ Download full analysis (JSON)",
+        data=to_json(result),
+        file_name="paper_dissector_analysis.json",
+        mime="application/json",
+        help="Includes audits, evidence and debate transcripts. Reload it in the sidebar.",
     )
 
 elif not uploaded:

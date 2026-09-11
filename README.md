@@ -40,7 +40,9 @@ they are the reason the roles are split the way they are:
 |----------|-------|-------------|
 | Gemini | **20 requests/day, per model** | Cannot serve a per-claim role. Used for the single whole-paper extraction call and for vision. |
 | Gemini | large context, no per-request cap | Ideal for the one call that needs all 12k tokens of the paper. |
-| Groq | **8000 tokens/minute** | A single request above this is rejected with HTTP 413, not throttled. Everything sent to Groq must stay under ~6500 tokens. |
+| Groq | **~7-8k tokens per request** | Varies per model: qwen3.8-27b allows 7000 input tokens, gpt-oss-120b 8000. Above it the request is rejected with HTTP 413, not throttled. |
+| Groq | **8000 tokens/minute** | Sets the pace of a run. Everything is queueing on this, not on model latency. |
+| Groq | **200,000 tokens/day** | The real ceiling on how much you can analyse per day: roughly 16-20 claims total across all runs. |
 | Groq | 1000 requests/day | Plenty; request count is never the binding constraint. |
 
 Two consequences worth knowing:
@@ -65,10 +67,15 @@ out; `gemini-3.6-flash` is the one to use.
 ## Key Differentiators
 
 - **Dual-track auditing** — checks the paper against itself AND external literature
-- **Multimodal grounding** — VLM reads figures/charts to catch visual-textual mismatches
+- **Multimodal grounding** — the VLM reads the figure or table a claim actually
+  cites, matched by its parsed number, to catch visual-textual mismatches
 - **Temporal staleness detection** — flags cherry-picked outdated baselines
-- **Progressive RAG in debate** — agents fire targeted searches mid-argument
+- **Progressive RAG in debate** — agents fire targeted searches mid-argument and
+  argue from what they retrieve
 - **Schema-constrained claims** — structured JSON, not vague text summaries
+- **No self-corroboration** — searching a paper's own claims reliably retrieves
+  that paper, so it is excluded from its own evidence. Without this, every claim
+  gained exactly one supporting citation: itself.
 
 ## Setup
 
@@ -177,6 +184,27 @@ print(result['final_report'].model_dump_json(indent=2))
 "
 ```
 
+### Saving and reopening an analysis
+
+A run costs several minutes of rate-limited calls, so the result is worth
+keeping. The report view offers **Download full analysis (JSON)** — audits,
+evidence, debate transcripts and verdicts — and the sidebar takes that file
+back to redisplay everything without spending quota again.
+
+Point the app at one directly for a demo:
+
+```bash
+PD_ANALYSIS_JSON=analysis.json streamlit run app.py
+```
+
+Programmatically:
+
+```python
+from paper_dissector.report_io import save_analysis, load_analysis
+save_analysis(result, "analysis.json")
+state = load_analysis("analysis.json")
+```
+
 ### Tuning
 
 Every setting below is an environment variable with a sensible default. These
@@ -206,10 +234,18 @@ run on a 15-page paper, 4 claims at 3 debate rounds, took 18 minutes:
 | debate | 488s | 122s per claim — the dominant cost, and it grows with rounds |
 | adjudicate | 64s | |
 
+A later run of 3 claims at 2 rounds completed in **382s**, with claim
+extraction on Gemini rather than the chunked fallback.
+
 Debate cost scales with `MAX_DEBATE_ROUNDS` times `MAX_CLAIMS`, and each round
 carries the transcript so far, so context grows within a claim. For a quick
 demonstration use `MAX_CLAIMS=2 MAX_DEBATE_ROUNDS=2`. A paid Groq tier removes
 the ceiling; nothing about the code changes.
+
+Exhausting a daily quota mid-run is handled, not fatal: a debate turn that hits
+it records the error on the transcript and the claim is still adjudicated on
+whatever was gathered. Daily caps are detected and not retried, since a
+per-day limit will not clear within a backoff window.
 
 External API responses are cached on disk under `.cache/`, so repeated runs
 during development do not re-hit rate limits. Clear it with:
@@ -217,6 +253,24 @@ during development do not re-hit rate limits. Clear it with:
 ```bash
 python -c "from paper_dissector import cache; cache.clear()"
 ```
+
+### Credibility is not confidence
+
+Each verdict carries two numbers, and conflating them inverts the result:
+
+- **`credibility`** — how well supported the claim is, implied by the verdict
+  label. This is what the paper-level `overall_score` averages.
+- **`confidence`** — how certain the judge is of that verdict. A claim can be
+  *confidently* NOT_SUPPORTED.
+
+The scaffold averaged confidence. In a real run the judge returned two claims
+as NOT_SUPPORTED with confidence 0.95 and one as SUPPORTED with 0.75, and the
+paper scored **0.883, "STRONGLY_SUPPORTED"** — two thirds of its claims had been
+rejected and the headline number said the opposite. Averaging credibility gives
+0.317, "WEAKLY_SUPPORTED".
+
+The same distinction applies in the UI: "Well-supported Claims" counts verdict
+labels, not confidence scores.
 
 ### Resilience
 
@@ -268,11 +322,23 @@ paper-dissector/
 ## Tests
 
 ```bash
-python tests/test_offline.py        # or: python -m pytest tests/ -q
+python -m pytest tests/ -q
+# or individually:
+python tests/test_offline.py        # pure logic
+python tests/test_report_view.py    # renders the Streamlit UI headlessly
 ```
 
-31 checks covering JSON coercion, claim dedup, figure matching, convergence
-detection, year resolution and verdict banding. No keys, no network.
+`test_offline.py` covers JSON coercion, claim dedup, figure matching,
+convergence calibration, year resolution, self-citation exclusion, request
+sizing and analysis round-tripping.
+
+`test_report_view.py` drives the Streamlit app against a saved analysis and
+asserts that every section actually renders — the executive summary, the audit
+severities, the VLM's figure reading, supporting papers, the staleness warning,
+the debate transcript, the mid-debate search and the concession badge. Before
+this existed the UI could only be checked by eye in a browser.
+
+Neither needs API keys or network access.
 
 ## Evaluation
 

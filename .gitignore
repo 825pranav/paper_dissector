@@ -13,4 +13,5 @@ venv/
 
 # Test artefacts
 test.pdf
+analysis.json
 *.log
