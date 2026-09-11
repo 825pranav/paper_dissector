@@ -4,76 +4,92 @@ The pipeline talks to this module rather than to a specific backend. Which
 backend answers is decided by ``LITERATURE_PROVIDER``:
 
 - ``auto`` (default): Semantic Scholar when ``SEMANTIC_SCHOLAR_API_KEY`` is set,
-  OpenAlex otherwise. The unauthenticated S2 search pool 429s on essentially
-  every call, so a keyless setup would otherwise find nothing.
-- ``semantic_scholar`` / ``openalex``: force one backend.
+  OpenAlex otherwise.
+- ``openalex`` / ``arxiv`` / ``semantic_scholar``: force one backend first.
 
-Both backends return records in the same shape (the Semantic Scholar one), so
-callers do not need to know which is active.
+Whatever the preference, the remaining keyless backends are tried in turn when
+the preferred one comes back empty. Each of these sources fails in a different
+way and none is reliably up on its own:
+
+- Semantic Scholar: unauthenticated search 429s on essentially every call.
+- OpenAlex: periodically pauses *anonymous* search under load (HTTP 503,
+  "Anonymous search is paused while the search cluster recovers"). A free
+  self-serve API key is exempt.
+- arXiv: reliable and keyless, but preprints only and no citation counts.
+
+All backends return records in the Semantic Scholar shape, so callers never
+need to know which one answered.
 """
 
 from __future__ import annotations
 
 import logging
 
-from paper_dissector.config import resolve_literature_provider
-from paper_dissector.tools import openalex, semantic_scholar
+from paper_dissector.config import literature_chain, resolve_literature_provider
+from paper_dissector.tools import arxiv, openalex, semantic_scholar
 
 log = logging.getLogger(__name__)
 
 _BACKENDS = {
     "semantic_scholar": semantic_scholar,
     "openalex": openalex,
+    "arxiv": arxiv,
 }
 
 
 def active_provider() -> str:
-    """Name of the backend currently serving requests."""
+    """Name of the preferred backend."""
     return resolve_literature_provider()
 
 
-def _backend():
-    return _BACKENDS[active_provider()]
+def _try_chain(operation: str, call, empty):
+    """
+    Run ``call`` against each backend in turn, returning the first real result.
 
+    ``call`` takes the backend module; ``empty`` is the value meaning "nothing
+    found" for this operation.
+    """
+    chain = literature_chain()
+    for i, name in enumerate(chain):
+        backend = _BACKENDS.get(name)
+        if backend is None:
+            continue
+        try:
+            result = call(backend)
+        except Exception as exc:
+            log.warning("%s via %s raised: %s", operation, name, exc)
+            continue
 
-def _fallback_backend():
-    """The other backend, used when the primary returns nothing usable."""
-    return _BACKENDS["openalex" if active_provider() == "semantic_scholar" else "semantic_scholar"]
+        if result:
+            if i:
+                log.info("%s served by fallback backend %s", operation, name)
+            return result
+
+    return empty
 
 
 def search_papers(query: str, limit: int = 10, year_range: str | None = None) -> list[dict]:
-    """Search the active literature backend, falling back to the other one."""
-    results = _backend().search_papers(query, limit=limit, year_range=year_range)
-    if results:
-        return results
-
-    # Only worth a second attempt when the fallback needs no credentials.
-    fallback = _fallback_backend()
-    if fallback is openalex:
-        log.debug("primary literature backend returned nothing for %r; trying OpenAlex", query)
-        return fallback.search_papers(query, limit=limit, year_range=year_range)
-    return results
+    """Search for papers, trying each available backend until one returns results."""
+    return _try_chain(
+        f"search({query[:48]!r})",
+        lambda b: b.search_papers(query, limit=limit, year_range=year_range),
+        [],
+    )
 
 
 def search_sota_for_task(task: str, metric: str, before_year: int, limit: int = 5) -> list[dict]:
     """Find work on a task+metric published before a cutoff, for staleness checks."""
-    results = _backend().search_sota_for_task(task, metric, before_year, limit=limit)
-    if results:
-        return results
-
-    fallback = _fallback_backend()
-    if fallback is openalex:
-        return fallback.search_sota_for_task(task, metric, before_year, limit=limit)
-    return results
+    return _try_chain(
+        "sota_search",
+        lambda b: b.search_sota_for_task(task, metric, before_year, limit=limit),
+        [],
+    )
 
 
 def lookup_paper_by_title(title: str) -> dict | None:
     """Resolve a paper record from its title, for publication-year lookup."""
-    record = _backend().lookup_paper_by_title(title)
-    if record:
-        return record
-
-    fallback = _fallback_backend()
-    if fallback is openalex:
-        return fallback.lookup_paper_by_title(title)
-    return record
+    return _try_chain(
+        f"title_lookup({title[:48]!r})",
+        lambda b: b.lookup_paper_by_title(title),
+        None,
+    )

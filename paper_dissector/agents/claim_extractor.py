@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 
-from paper_dissector.config import AUDIT_CONTEXT_CHARS, MAX_CLAIMS
+from paper_dissector.config import (
+    EXTRACTION_CHUNK_CHARS, EXTRACTION_CONTEXT_CHARS, MAX_CLAIMS,
+)
 from paper_dissector.llm import chat_json
 from paper_dissector.sanitize import as_text
 from paper_dissector.schemas import Claim, ClaimExtractionResult
@@ -81,6 +83,85 @@ def _build_claim(raw: dict, index: int) -> Claim | None:
         return None
 
 
+def _claims_from_response(parsed: dict, start_index: int = 1) -> list[Claim]:
+    """Turn one extraction response into Claim objects, skipping malformed rows."""
+    raw_claims = parsed.get("claims")
+    if not isinstance(raw_claims, list):
+        # Some models return a bare list, which chat_json wraps as {"items": [...]}.
+        raw_claims = parsed.get("items", [])
+
+    out: list[Claim] = []
+    for offset, raw in enumerate(raw_claims):
+        claim = _build_claim(raw, start_index + offset)
+        if claim is not None:
+            out.append(claim)
+    return out
+
+
+def _chunk_markdown(markdown: str, chunk_chars: int) -> list[str]:
+    """Split the paper on section boundaries into chunks of roughly chunk_chars."""
+    blocks, current = [], []
+    for line in markdown.splitlines():
+        if line.lstrip().startswith("#") and current:
+            blocks.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+
+    chunks: list[str] = []
+    buf = ""
+    for block in blocks:
+        # A single oversized section is split on its own rather than dropped.
+        while len(block) > chunk_chars:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            chunks.append(block[:chunk_chars])
+            block = block[chunk_chars:]
+        if len(buf) + len(block) > chunk_chars and buf:
+            chunks.append(buf)
+            buf = block
+        else:
+            buf = f"{buf}\n{block}" if buf else block
+    if buf.strip():
+        chunks.append(buf)
+    return [c for c in chunks if c.strip()]
+
+
+def _extract_chunked(markdown: str) -> list[Claim]:
+    """
+    Fallback extraction for a small-context provider.
+
+    The primary extractor sees the whole paper in one call. When that provider
+    is unavailable — Gemini's 20-requests-per-day exhausted, or the endpoint
+    down — the paper is split into section-aligned chunks that fit Groq's
+    per-request ceiling and each chunk is extracted separately.
+    """
+    chunks = _chunk_markdown(markdown, EXTRACTION_CHUNK_CHARS)
+    log.info("falling back to chunked extraction over %d chunk(s)", len(chunks))
+
+    claims: list[Claim] = []
+    for i, chunk in enumerate(chunks, start=1):
+        try:
+            parsed = chat_json(
+                "claim_extractor_fallback",
+                SYSTEM_PROMPT,
+                (
+                    f"This is part {i} of {len(chunks)} of a research paper. "
+                    f"Extract the falsifiable claims it contains:\n\n{chunk}"
+                ),
+                temperature=0.1,
+            )
+        except Exception as exc:
+            log.warning("chunked extraction failed on chunk %d/%d: %s", i, len(chunks), exc)
+            continue
+        claims.extend(_claims_from_response(parsed, start_index=len(claims) + 1))
+
+    return claims
+
+
 def extract_claims(state: PaperState) -> dict:
     """LangGraph node: extract claims from parsed markdown."""
     markdown = state.get("parsed_markdown") or ""
@@ -88,13 +169,14 @@ def extract_claims(state: PaperState) -> dict:
         log.error("no parsed markdown available; cannot extract claims")
         return {"claims": []}
 
-    # Gemini Flash handles 1M tokens, but a huge paper still costs latency and
-    # can trip free-tier per-request limits — keep the body bounded.
-    if len(markdown) > AUDIT_CONTEXT_CHARS:
+    # The extractor runs on a large-context provider so it sees the whole paper;
+    # this ceiling only guards against a pathologically long document.
+    if len(markdown) > EXTRACTION_CONTEXT_CHARS:
         log.info("truncating paper from %d to %d chars for extraction",
-                 len(markdown), AUDIT_CONTEXT_CHARS)
-        markdown = markdown[:AUDIT_CONTEXT_CHARS]
+                 len(markdown), EXTRACTION_CONTEXT_CHARS)
+        markdown = markdown[:EXTRACTION_CONTEXT_CHARS]
 
+    claims: list[Claim] = []
     try:
         parsed = chat_json(
             "claim_extractor",
@@ -102,20 +184,16 @@ def extract_claims(state: PaperState) -> dict:
             f"Extract all falsifiable claims from this paper:\n\n{markdown}",
             temperature=0.1,
         )
+        claims = _claims_from_response(parsed)
     except Exception as exc:
-        log.error("claim extraction failed: %s", exc)
+        log.warning("primary claim extraction failed (%s); trying chunked fallback", exc)
+
+    if not claims:
+        claims = _extract_chunked(markdown)
+
+    if not claims:
+        log.error("claim extraction produced nothing; downstream stages will be empty")
         return {"claims": []}
-
-    raw_claims = parsed.get("claims")
-    if not isinstance(raw_claims, list):
-        # Some models return a bare list, which chat_json wraps as {"items": [...]}.
-        raw_claims = parsed.get("items", [])
-
-    claims: list[Claim] = []
-    for i, raw in enumerate(raw_claims, start=1):
-        claim = _build_claim(raw, i)
-        if claim is not None:
-            claims.append(claim)
 
     claims = deduplicate_claims(claims)
 

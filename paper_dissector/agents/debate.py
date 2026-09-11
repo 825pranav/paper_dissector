@@ -101,8 +101,26 @@ def _build_context(
 
 # ── Convergence detection ────────────────────────────────────────
 
+# Two arguments about the same claim inevitably share the claim's vocabulary and
+# a lot of function words, which inflates similarity. Comparing content words
+# only keeps genuine repetition high while letting distinct arguments separate.
+_STOPWORDS = frozenset("""
+a an the and or but if then than that this these those there here is are was were
+be been being am do does did doing have has had having will would shall should
+can could may might must of in on at to for with without from by as into over
+under about against between during before after above below up down out off
+again further once it its it s he she they them his her their we us our you your
+i me my not no nor only own same so too very s t don now also however moreover
+which who whom what when where why how all any both each few more most other some
+such more paper claim authors argument point evidence
+""".split())
+
+
 def _tokens(text: str) -> Counter:
-    return Counter(_TOKEN_RE.findall((text or "").lower()))
+    return Counter(
+        w for w in _TOKEN_RE.findall((text or "").lower())
+        if w not in _STOPWORDS and len(w) > 2
+    )
 
 
 def _cosine(a: Counter, b: Counter) -> float:
