@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import re
+from difflib import SequenceMatcher
 
 from paper_dissector.llm import chat_json
 from paper_dissector.sanitize import as_text
@@ -80,8 +82,39 @@ def _dedupe_key(paper: dict) -> str:
     return f"id:{paper.get('paperId', '')}"
 
 
-def _retrieve_and_classify(claim: Claim, queries: list[str]) -> tuple[list[RetrievedPaper], list[RetrievedPaper], list[RetrievedPaper]]:
-    """Search Semantic Scholar and classify stance of retrieved papers."""
+def _normalise_title(text: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", " ", (text or "").lower()).split())
+
+
+def is_same_paper(candidate_title: str, paper_title: str) -> bool:
+    """
+    True when a retrieved record is the paper being analysed.
+
+    Searching a paper's own claims reliably retrieves that paper, and counting
+    it as supporting evidence is circular — it inflates every claim's support
+    by exactly one. Matched on normalised title rather than id, because the
+    same work appears under different ids across backends.
+    """
+    a, b = _normalise_title(candidate_title), _normalise_title(paper_title)
+    if not a or not b or len(b) < 10:
+        return False
+    if a == b:
+        return True
+
+    # Containment alone is not enough: "Attention Is All You Need In Speech
+    # Separation" contains the title of a different paper. Require the two to be
+    # nearly the same length as well, so only punctuation or subtitle noise
+    # separates them.
+    if (a in b or b in a) and min(len(a), len(b)) / max(len(a), len(b)) > 0.85:
+        return True
+
+    return SequenceMatcher(None, a, b).ratio() > 0.9
+
+
+def _retrieve_and_classify(
+    claim: Claim, queries: list[str], paper_title: str = "",
+) -> tuple[list[RetrievedPaper], list[RetrievedPaper], list[RetrievedPaper]]:
+    """Search the literature backend and classify the stance of retrieved papers."""
     supporting, contradicting, neutral = [], [], []
     seen: set[str] = set()
     candidates: list[dict] = []
@@ -89,6 +122,9 @@ def _retrieve_and_classify(claim: Claim, queries: list[str]) -> tuple[list[Retri
     for query in queries:
         for p in search_papers(query, limit=5):
             if not p.get("abstract"):
+                continue
+            if paper_title and is_same_paper(p.get("title") or "", paper_title):
+                log.debug("excluding the paper under analysis from its own evidence")
                 continue
             key = _dedupe_key(p)
             if not key or key in seen:
@@ -205,11 +241,15 @@ def gather_evidence(state: PaperState) -> dict:
     if not paper_year:
         log.info("no publication year available — skipping staleness detection")
 
+    paper_title = state.get("paper_title") or ""
+
     for claim in claims:
         # A failure on one claim degrades that claim only.
         try:
             queries = _generate_queries(claim)
-            supporting, contradicting, neutral = _retrieve_and_classify(claim, queries)
+            supporting, contradicting, neutral = _retrieve_and_classify(
+                claim, queries, paper_title,
+            )
             staleness = _check_staleness(claim, paper_year)
         except Exception as exc:
             log.error("evidence gathering failed for %s: %s", claim.claim_id, exc)

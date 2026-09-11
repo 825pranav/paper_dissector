@@ -158,15 +158,6 @@ def _year_filter(year_range: str | None) -> str | None:
         return None
 
 
-def get_paper_details(paper_id: str) -> dict | None:
-    """Get full details for a single work by OpenAlex ID or DOI."""
-    if not paper_id:
-        return None
-    ident = paper_id if paper_id.upper().startswith("W") else f"doi:{paper_id}"
-    payload = _client.get(f"/works/{ident}", _base_params(), default=None)
-    return _normalise(payload) if isinstance(payload, dict) else None
-
-
 def _normalised_title(text: str) -> str:
     return " ".join((text or "").lower().split())
 

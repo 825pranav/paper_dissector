@@ -9,6 +9,7 @@ that need a provider are covered by running the pipeline itself.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -18,15 +19,22 @@ from paper_dissector.agents.claim_extractor import deduplicate_claims
 from paper_dissector.agents.debate import (
     _cited_evidence, _extract_search_query, argument_similarity,
 )
-from paper_dissector.agents.evidence_hunter import _dedupe_key, _staleness_score
+from paper_dissector.agents.evidence_hunter import (
+    _dedupe_key, _staleness_score, is_same_paper,
+)
 from paper_dissector.agents.internal_auditor import build_audit_excerpt, match_figures_for_claim
-from paper_dissector.agents.judge import _build_verdict, _label_for_score
+from paper_dissector.agents.judge import _build_verdict, _label_for_score, credibility_for
 from paper_dissector.config import CONVERGENCE_THRESHOLD, input_token_budget
 from paper_dissector.llm import (
     LLMJSONError, _estimate_tokens, _fit_to_budget, extract_json,
 )
 from paper_dissector.sanitize import as_bool, as_str_list, as_text, clamp01, coerce_enum
-from paper_dissector.schemas import AuditSeverity, Claim, VerdictLabel
+from paper_dissector.report_io import from_dict, to_json
+from paper_dissector.schemas import (
+    AuditSeverity, Claim, ClaimVerdict, DebateRole, DebateTranscript, DebateTurn,
+    ExternalEvidenceResult, FinalReport, InternalAuditResult, RetrievedPaper,
+    Stance, StalenessEntry, VerdictLabel,
+)
 from paper_dissector.tools.openalex import _reconstruct_abstract, _year_filter
 from paper_dissector.tools.pdf_parser import _figure_number, _plausible_years, extract_year
 
@@ -139,6 +147,47 @@ def test_convergence_separates_realistic_debate_turns():
 def test_progressive_rag_query_parsing():
     assert _extract_search_query('x\nSEARCH_REQUEST: "convnext imagenet"\ny') == "convnext imagenet"
     assert _extract_search_query("just an argument") is None
+
+
+def test_search_query_is_stripped_of_markdown():
+    assert _extract_search_query(
+        'SEARCH_REQUEST: ** "WMT14 bootstrap significance 2 BLEU"\nmore prose'
+    ) == "WMT14 bootstrap significance 2 BLEU"
+    assert _extract_search_query('**SEARCH_REQUEST:** "convnext imagenet"') == "convnext imagenet"
+    assert _extract_search_query("SEARCH_REQUEST: transformer ablation study.") == "transformer ablation study"
+
+
+def test_search_query_survives_real_model_output():
+    """
+    Verbatim samples from runs. Whatever survives here is sent to the search
+    backend, so decoration and the model's own continuation must be cut.
+    """
+    # Markdown emphasis leaking into the captured group.
+    assert _extract_search_query(
+        'SEARCH_REQUEST: ** "WMT14 English German bootstrap significance 2 BLEU difference"'
+    ) == "WMT14 English German bootstrap significance 2 BLEU difference"
+
+    # Smart quotes, a non-breaking hyphen, an HTML entity, and the model
+    # inventing its own RESULT section with fabricated citations.
+    assert _extract_search_query(
+        "SEARCH_REQUEST: “BLEU variance across random seeds WMT14 English‑German "
+        "Transformer” &lt;br RESULT: Ott et al., “Scaling Neural Machine "
+        "Translation” (2020) report a 95 % bootstrap confidence interval"
+    ) == "BLEU variance across random seeds WMT14 English-German Transformer"
+
+    # A trailing JSON fragment.
+    assert _extract_search_query(
+        'SEARCH_REQUEST: Vaswani 2017 attention global receptive field constant depth"}.'
+    ) == "Vaswani 2017 attention global receptive field constant depth"
+
+    assert _extract_search_query("SEARCH_REQUEST:    ") is None
+
+
+def test_search_query_length_is_capped():
+    long_query = _extract_search_query("SEARCH_REQUEST: " + "benchmark " * 40)
+    assert long_query is not None
+    assert len(long_query) <= 120
+    assert not long_query.endswith("benchm")   # cut on a word boundary
 
 
 def test_evidence_citation_extraction():
@@ -316,6 +365,109 @@ def test_papers_dedupe_on_doi_across_provider_ids():
     assert _dedupe_key(a) != _dedupe_key(c)
 
 
+# ── Self-citation exclusion ──────────────────────────────────────
+
+def test_paper_is_excluded_as_its_own_evidence():
+    """
+    Searching a paper's own claims retrieves that paper. Counting it as support
+    is circular — it added exactly one supporting paper to every claim.
+    """
+    title = "Attention Is All You Need"
+    assert is_same_paper("Attention Is All You Need", title)
+    assert is_same_paper("attention is all you need", title)
+    assert is_same_paper("Attention Is All You Need.", title)
+
+
+def test_similarly_titled_papers_are_not_excluded():
+    title = "Attention Is All You Need"
+    assert not is_same_paper("Attention Is All You Need In Speech Separation", title)
+    assert not is_same_paper("Is Space-Time Attention All You Need for Video Understanding?", title)
+    assert not is_same_paper("Cross-Attention is All You Need: Adapting Pretrained Transformers", title)
+    assert not is_same_paper("", title)
+    assert not is_same_paper("Anything", "")
+
+
+# ── Analysis persistence ─────────────────────────────────────────
+
+def _sample_state():
+    claim = mkclaim(text="Our model reaches 41.8 BLEU.", metric="BLEU", reported_value=41.8)
+    audit = InternalAuditResult(
+        claim_id="C1", table_consistency=AuditSeverity.PASS,
+        figure_consistency=AuditSeverity.WARN, baseline_present=True,
+        statistical_rigor=AuditSeverity.WARN, mismatch_score=0.2,
+        visual_mismatch_detail="The table shows 41.8 for the big model.",
+    )
+    evidence = ExternalEvidenceResult(
+        claim_id="C1",
+        supporting_papers=[RetrievedPaper(
+            paper_id="W1", title="A corroborating study", year=2018,
+            relevant_passage="We measure 41.7 BLEU.", stance=Stance.SUPPORT,
+            stance_confidence=0.8, doi="10.1/x", url="https://example.org/x",
+        )],
+        staleness_entries=[StalenessEntry(
+            baseline_name="ConvS2S", baseline_year=2017, staleness_score=3.0,
+            verdict="CURRENT",
+        )],
+    )
+    transcript = DebateTranscript(
+        claim_id="C1", total_rounds=1, terminated_reason="defender_concession",
+        turns=[
+            DebateTurn(agent=DebateRole.PROSECUTOR, round_num=1, argument="No CIs reported.",
+                       evidence_cited=["statistical_rigor"],
+                       new_retrieval={"query": "bleu significance", "results": []}),
+            # Consistent with terminated_reason above: the turn that conceded
+            # must carry the flag, or the transcript contradicts itself.
+            DebateTurn(agent=DebateRole.DEFENDER, round_num=1,
+                       argument="CONCEDE: no significance test is reported.",
+                       concedes=True),
+        ],
+    )
+    verdict = ClaimVerdict(claim_id="C1", verdict=VerdictLabel.SUPPORTED, confidence=0.75,
+                           credibility=credibility_for(VerdictLabel.SUPPORTED),
+                           justification="Matches Table 2.", flags=["NO_STATISTICAL_TEST"])
+    report = FinalReport(paper_title="A Great Paper", authors=["A. Author"],
+                         overall_score=0.75, overall_verdict=VerdictLabel.SUPPORTED,
+                         total_claims=1, claim_verdicts=[verdict])
+    return {
+        "paper_title": "A Great Paper", "paper_authors": ["A. Author"], "paper_year": 2017,
+        "claims": [claim], "internal_audits": [audit], "external_evidence": [evidence],
+        "debate_transcripts": [transcript], "verdicts": [verdict], "final_report": report,
+        "extracted_figures": [{"figure_id": "table_1", "figure_number": "table:2",
+                               "caption": "Table 2", "image_b64": "AAAA" * 500}],
+    }
+
+
+def test_analysis_round_trips_through_json():
+    original = _sample_state()
+    restored = from_dict(json.loads(to_json(original)))
+
+    assert restored["final_report"].paper_title == "A Great Paper"
+    assert restored["paper_year"] == 2017
+    assert restored["claims"][0].reported_value == 41.8
+    assert restored["internal_audits"][0].table_consistency is AuditSeverity.PASS
+    assert restored["external_evidence"][0].supporting_papers[0].stance is Stance.SUPPORT
+    assert restored["external_evidence"][0].staleness_entries[0].baseline_name == "ConvS2S"
+    assert restored["debate_transcripts"][0].terminated_reason == "defender_concession"
+    assert restored["debate_transcripts"][0].turns[0].new_retrieval["query"] == "bleu significance"
+    assert restored["verdicts"][0].verdict is VerdictLabel.SUPPORTED
+
+
+def test_saved_analysis_drops_figure_image_bytes():
+    # Base64 images are large and the report view never shows them.
+    payload = json.loads(to_json(_sample_state()))
+    assert payload["extracted_figures"][0]["figure_number"] == "table:2"
+    assert "image_b64" not in payload["extracted_figures"][0]
+    assert len(json.dumps(payload)) < 6000
+
+
+def test_malformed_entries_are_skipped_not_fatal():
+    payload = json.loads(to_json(_sample_state()))
+    payload["claims"].append({"nonsense": True})
+    restored = from_dict(payload)
+    assert len(restored["claims"]) == 1          # the good one survives
+    assert restored["final_report"] is not None
+
+
 # ── Scoring ──────────────────────────────────────────────────────
 
 def test_staleness_score_scaling():
@@ -331,6 +483,32 @@ def test_verdict_bands():
     assert _label_for_score(0.5) is VerdictLabel.PARTIALLY_SUPPORTED
     assert _label_for_score(0.3) is VerdictLabel.WEAKLY_SUPPORTED
     assert _label_for_score(0.05) is VerdictLabel.NOT_SUPPORTED
+
+
+def test_confidently_rejected_claims_do_not_inflate_the_score():
+    """
+    A real run judged 2 of 3 claims NOT_SUPPORTED with confidence 0.95 and
+    reported the paper as 0.883 STRONGLY_SUPPORTED, because the score averaged
+    the judge's certainty instead of the claims' credibility.
+    """
+    verdicts = [
+        _build_verdict({"verdict": "NOT_SUPPORTED", "confidence": 0.95, "justification": "x"}, "C1"),
+        _build_verdict({"verdict": "NOT_SUPPORTED", "confidence": 0.95, "justification": "x"}, "C2"),
+        _build_verdict({"verdict": "SUPPORTED", "confidence": 0.75, "justification": "x"}, "C3"),
+    ]
+    assert verdicts[0].confidence == 0.95          # certainty preserved
+    assert verdicts[0].credibility == 0.10         # but credibility is low
+
+    overall = sum(v.credibility for v in verdicts) / len(verdicts)
+    assert overall < 0.4
+    assert _label_for_score(overall) in (VerdictLabel.WEAKLY_SUPPORTED,
+                                         VerdictLabel.NOT_SUPPORTED)
+
+
+def test_credibility_tracks_the_verdict_label():
+    for label in VerdictLabel:
+        score = credibility_for(label)
+        assert _label_for_score(score) is label, f"{label} round-trips to {_label_for_score(score)}"
 
 
 def test_verdict_recovers_from_malformed_judge_output():

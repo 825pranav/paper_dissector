@@ -109,7 +109,13 @@ class VerdictLabel(str, Enum):
 class ClaimVerdict(BaseModel):
     claim_id: str
     verdict: VerdictLabel
+    # How certain the judge is of the verdict. NOT a measure of the claim's
+    # credibility: a claim can be confidently NOT_SUPPORTED. Aggregating this
+    # would let confidently-rejected claims raise a paper's score.
     confidence: float = Field(ge=0.0, le=1.0)
+    # How well supported the claim is, derived from the verdict label. This is
+    # what the paper-level score aggregates.
+    credibility: float = Field(default=0.5, ge=0.0, le=1.0)
     justification: str
     flags: list[str] = Field(default_factory=list)
     prosecutor_strongest: str = ""

@@ -58,37 +58,6 @@ def search_papers(query: str, limit: int = 10, year_range: str | None = None) ->
     return payload.get("data", []) if isinstance(payload, dict) else []
 
 
-def get_paper_details(paper_id: str) -> dict | None:
-    """Get full details for a single paper by Semantic Scholar ID or DOI."""
-    return _get(
-        f"/paper/{paper_id}",
-        {"fields": _FIELDS + ",references,citations,tldr"},
-        default=None,
-    )
-
-
-def get_citations(paper_id: str, limit: int = 20) -> list[dict]:
-    """Get papers that cite the given paper (forward citations)."""
-    payload = _get(
-        f"/paper/{paper_id}/citations",
-        {"fields": "paperId,title,year,abstract,citationCount", "limit": limit},
-        default={},
-    )
-    rows = payload.get("data", []) if isinstance(payload, dict) else []
-    return [c["citingPaper"] for c in rows if c.get("citingPaper")]
-
-
-def get_references(paper_id: str, limit: int = 50) -> list[dict]:
-    """Get papers cited by the given paper (backward references)."""
-    payload = _get(
-        f"/paper/{paper_id}/references",
-        {"fields": "paperId,title,year,abstract,citationCount", "limit": limit},
-        default={},
-    )
-    rows = payload.get("data", []) if isinstance(payload, dict) else []
-    return [r["citedPaper"] for r in rows if r.get("citedPaper")]
-
-
 def search_sota_for_task(task: str, metric: str, before_year: int, limit: int = 5) -> list[dict]:
     """
     Search for SOTA results on a task+metric, filtered to papers published before a cutoff.
