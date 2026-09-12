@@ -1,4 +1,4 @@
-# 🔬 Paper Dissector
+# Paper Dissector
 
 **Multi-agent adversarial credibility analysis for research papers.**
 
