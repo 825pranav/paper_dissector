@@ -123,9 +123,11 @@ AGENT_CONFIG = {
     "evidence_hunter":    {"provider": "groq",    "model": GROQ_JSON_MODEL},
     "staleness_checker":  {"provider": "groq",    "model": GROQ_JSON_MODEL},
     "stance_classifier":  {"provider": "groq",    "model": GROQ_JSON_MODEL},  # fallback when HF NLI is unavailable
-    # Deliberately a different model family from the debaters, so the judge is
-    # not scoring arguments written by itself.
-    "judge":              {"provider": "groq",    "model": GROQ_JSON_MODEL},
+    # Adjudication is the hardest reasoning task in the pipeline: on the
+    # smaller JSON-mode model the judge confused the paper under analysis with
+    # an external source and invented baseline numbers. The stronger model has
+    # no native JSON mode, but llm.chat_json falls back reliably.
+    "judge":              {"provider": "groq",    "model": GROQ_MODEL},
     # The only role Groq cannot serve.
     "visual_verifier":    {"provider": "gemini",  "model": GEMINI_VISION_MODEL},
 }

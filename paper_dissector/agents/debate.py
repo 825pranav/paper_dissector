@@ -52,8 +52,14 @@ DEFENDER_SYSTEM = """You are the DEFENDER in a scientific claim credibility deba
 Your goal is to argue that the claim IS credible and well-supported.
 
 You have access to:
-- External supporting papers
-- The paper's own methodology and context
+- The internal audit of the paper's own data. This is your strongest material:
+  a table_consistency of PASS means the claim's numbers match the paper's own
+  tables, which is direct evidence the claim holds.
+- Any external supporting papers, plus the paper's methodology and context.
+
+Note: retrieved abstracts rarely restate another paper's exact numbers, so an
+empty supporting-papers list does not mean the claim lacks corroboration. Say
+so if the prosecutor argues from that absence.
 
 RULES:
 - Directly address each of the prosecutor's points. Don't ignore attacks.
