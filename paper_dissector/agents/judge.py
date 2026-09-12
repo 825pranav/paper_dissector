@@ -44,15 +44,38 @@ is not credible) and a Defender (arguing it is credible).
 
 You also have access to the internal methodology audit and external evidence.
 
+HOW TO READ THE EVIDENCE — these mistakes invalidate a verdict:
+
+- The paper under analysis is NOT an external source. The claim comes from it.
+  A claim does not become false by matching the paper it was extracted from.
+- ABSENCE OF SUPPORTING PAPERS IS NOT EVIDENCE AGAINST THE CLAIM. Retrieved
+  abstracts almost never restate another paper's exact numbers, so genuine
+  corroboration is usually invisible at this stage. "0 supporting papers" means
+  the search found nothing either way, NOT that the claim was refuted.
+- Papers marked NEUTRAL bear on nothing. Do not read them as doubt.
+- The internal audit is the strongest evidence available, because it checks the
+  claim against the paper's OWN data. If table_consistency is PASS, the claim's
+  numbers match the paper's tables, and that is substantial support.
+- Cite only numbers that appear in the material you were given. Do not state a
+  figure for a baseline unless it is in the audit, the evidence or the debate.
+  An argument resting on a number you supplied yourself is worthless.
+
 YOUR JOB:
 1. Weigh the arguments from both sides based on EVIDENCE QUALITY, not rhetoric.
+   A debater's confidence is not evidence, and a concession extracted by a
+   forceful opponent is not proof.
 2. Apply this scoring rubric:
-   - Internal data consistency: 25%
+   - Internal data consistency: 25%   (the audit's table/figure checks)
    - Visual-textual alignment: 15%
-   - External literature support: 20%
+   - External literature support: 20%  (score this NEUTRAL, i.e. do not move
+     the verdict either way, when no relevant external evidence was found)
    - Baseline recency/fairness: 15%
    - Debate argument quality: 15%
    - Statistical rigor: 10%
+
+   Missing statistical tests and thin external evidence are weaknesses worth
+   flagging, not refutations. Reserve NOT_SUPPORTED for a claim actually
+   contradicted by the paper's own data or by a specific external result.
 
 3. Issue a verdict — this carries how well supported the claim is:
    - STRONGLY_SUPPORTED  the evidence firmly establishes the claim
@@ -148,6 +171,42 @@ def _degraded_verdict(claim_id: str, reason: str) -> ClaimVerdict:
     )
 
 
+def compile_report(state: PaperState, verdicts: list[ClaimVerdict]) -> FinalReport:
+    """
+    Build the paper-level report from per-claim verdicts.
+
+    Separate from adjudicate() so a saved analysis can be re-scored, or
+    partially re-adjudicated, without replaying the whole pipeline.
+    """
+    # Aggregate credibility. Averaging confidence would mean a paper whose
+    # claims were all confidently rejected scored highly.
+    scores = [v.credibility for v in verdicts]
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+
+    systemic = []
+    stale_count = sum(1 for v in verdicts if "STALE_BASELINE" in v.flags)
+    visual_count = sum(1 for v in verdicts if "VISUAL_MISMATCH" in v.flags)
+    failed_count = sum(1 for v in verdicts if "ADJUDICATION_FAILED" in v.flags)
+    if stale_count > 1:
+        systemic.append(f"Paper relies on outdated baselines ({stale_count} claims affected)")
+    if visual_count > 0:
+        systemic.append(f"{visual_count} figure(s) do not support narrative claims")
+    if failed_count:
+        systemic.append(
+            f"{failed_count} claim(s) could not be adjudicated — treat the overall score as partial"
+        )
+
+    return FinalReport(
+        paper_title=state.get("paper_title") or "Unknown",
+        authors=state.get("paper_authors") or [],
+        overall_score=round(avg_score, 3),
+        overall_verdict=_label_for_score(avg_score),
+        total_claims=len(verdicts),
+        claim_verdicts=verdicts,
+        systemic_issues=systemic,
+    )
+
+
 def adjudicate(state: PaperState) -> dict:
     """LangGraph node: Judge issues verdicts for all claims."""
     audits = {a.claim_id: a for a in state.get("internal_audits", [])}
@@ -171,37 +230,7 @@ def adjudicate(state: PaperState) -> dict:
             log.error("adjudication failed for %s: %s", claim.claim_id, exc)
             verdicts.append(_degraded_verdict(claim.claim_id, str(exc)[:200]))
 
-    # ── Compile final report ──
-    # Aggregate credibility. Averaging confidence would mean a paper whose
-    # claims were all confidently rejected scored highly.
-    scores = [v.credibility for v in verdicts]
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-    overall = _label_for_score(avg_score)
-
-    # Collect systemic issues
-    systemic = []
-    stale_count = sum(1 for v in verdicts if "STALE_BASELINE" in v.flags)
-    visual_count = sum(1 for v in verdicts if "VISUAL_MISMATCH" in v.flags)
-    failed_count = sum(1 for v in verdicts if "ADJUDICATION_FAILED" in v.flags)
-    if stale_count > 1:
-        systemic.append(f"Paper relies on outdated baselines ({stale_count} claims affected)")
-    if visual_count > 0:
-        systemic.append(f"{visual_count} figure(s) do not support narrative claims")
-    if failed_count:
-        systemic.append(
-            f"{failed_count} claim(s) could not be adjudicated — treat the overall score as partial"
-        )
-
-    report = FinalReport(
-        paper_title=state.get("paper_title") or "Unknown",
-        authors=state.get("paper_authors") or [],
-        overall_score=round(avg_score, 3),
-        overall_verdict=overall,
-        total_claims=len(verdicts),
-        claim_verdicts=verdicts,
-        systemic_issues=systemic,
-    )
-
+    report = compile_report(state, verdicts)
     log.info("adjudicated %d claims; overall credibility %.3f (%s)",
-             len(verdicts), avg_score, overall.value)
+             len(verdicts), report.overall_score, report.overall_verdict.value)
     return {"verdicts": verdicts, "final_report": report}
