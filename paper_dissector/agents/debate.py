@@ -23,6 +23,13 @@ log = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _SEARCH_RE = re.compile(r"SEARCH_REQUEST:\s*(.+)")
+# Conceding the whole claim, as opposed to a single point ("CONCEDE:"). Models
+# wrap the marker in markdown ("**CONCEDE_CLAIM:**"), so match it loosely.
+_FULL_CONCESSION_RE = re.compile(r"CONCEDE[_ ]CLAIM\s*\**\s*:", re.IGNORECASE)
+
+# No early stop before this round: in real runs a partial concession on a side
+# point ended two of three debates after the first exchange.
+MIN_DEBATE_ROUNDS = 2
 
 PROSECUTOR_SYSTEM = """You are the PROSECUTOR in a scientific claim credibility debate.
 Your goal is to argue that the claim is NOT credible or is overstated.
@@ -41,8 +48,10 @@ RULES:
   You may do this up to {max_prag} times. Using it is expected, not exceptional:
   an argument backed by a result you retrieved is far stronger than one that
   only reasons about the evidence already in front of you.
-- You can CONCEDE a point if the defender's rebuttal is genuinely strong.
-  Format: CONCEDE: "what you're conceding and why"
+- You can CONCEDE a single point if the defender's rebuttal is genuinely strong.
+  Format: CONCEDE: "what you're conceding and why". The debate continues.
+- Only if you now believe the claim is credible overall, concede the whole claim:
+  CONCEDE_CLAIM: "why the claim stands". This ends the debate.
 - Stay focused on the specific claim, not the paper in general.
 - Do not repeat an argument you have already made. Advance the debate or concede.
 
@@ -54,7 +63,8 @@ Your goal is to argue that the claim IS credible and well-supported.
 You have access to:
 - The internal audit of the paper's own data. This is your strongest material:
   a table_consistency of PASS means the claim's numbers match the paper's own
-  tables, which is direct evidence the claim holds.
+  reported data (tables, or the text where no table reports them), which is
+  direct evidence the claim holds.
 - Any external supporting papers, plus the paper's methodology and context.
 
 Note: retrieved abstracts rarely restate another paper's exact numbers, so an
@@ -69,8 +79,10 @@ RULES:
   SEARCH_REQUEST: "your query here"
   You may do this up to {max_prag} times. Using it is expected, not exceptional:
   independent corroboration you retrieved is the strongest defence available.
-- You can CONCEDE a point if the prosecutor's evidence is genuinely strong.
-  Format: CONCEDE: "what you're conceding and why"
+- You can CONCEDE a single point if the prosecutor's evidence is genuinely strong.
+  Format: CONCEDE: "what you're conceding and why". The debate continues.
+- Only if you now believe the claim is NOT credible overall, concede the whole
+  claim: CONCEDE_CLAIM: "why the claim fails". This ends the debate.
 - Acknowledge limitations honestly — partial concessions build credibility.
 - Do not repeat an argument you have already made. Advance the debate or concede.
 
@@ -302,8 +314,14 @@ def _handle_progressive_rag(
 
 
 def _check_concession(response_text: str) -> bool:
-    """Check if agent explicitly conceded."""
-    return "CONCEDE:" in (response_text or "")
+    """
+    True only when the agent concedes the whole claim.
+
+    A "CONCEDE:" on a single point (e.g. "no confidence intervals are reported")
+    is how a debater acknowledges a limitation, and the defender is told to do
+    so; treating it as conceding the claim ended debates after one exchange.
+    """
+    return bool(_FULL_CONCESSION_RE.search(response_text or ""))
 
 
 def _cited_evidence(response_text: str) -> list[str]:
@@ -372,6 +390,9 @@ def _run_one_debate(
                 concedes=_check_concession(text),
             )
             turns.append(turn)
+
+            if round_num < min(MIN_DEBATE_ROUNDS, MAX_DEBATE_ROUNDS):
+                continue
 
             if turn.concedes:
                 return DebateTranscript(

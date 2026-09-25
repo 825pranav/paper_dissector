@@ -24,6 +24,10 @@ RULES:
 - Each claim must be atomic — one measurable assertion per claim.
 - Fill in ALL schema fields. If a baseline isn't mentioned, set it to null.
 - The falsifiability_threshold should specify what evidence would DISPROVE the claim.
+- If the claim's numbers come from, or are plotted in, a figure or table, name it in
+  source_section, e.g. "Section 3.5 / Figure 6" or "Section 4 / Table 2". The figure
+  is checked against the claim, so name it whenever the claim depends on one, even
+  if the sentence itself does not mention it.
 - Target 5–20 claims per paper depending on paper length.
 
 Respond ONLY with valid JSON matching this schema:
@@ -39,7 +43,7 @@ Respond ONLY with valid JSON matching this schema:
       "reported_value": 94.2 or "significant" or null,
       "scope": "dataset, setting, constraints",
       "falsifiability_threshold": "what would disprove this",
-      "source_section": "Section X.Y / Table N"
+      "source_section": "Section X.Y / Table N or Figure N, if the claim depends on one"
     }
   ]
 }"""
