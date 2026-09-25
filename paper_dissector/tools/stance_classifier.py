@@ -131,11 +131,17 @@ Respond ONLY with JSON:
 Include exactly one entry per passage, in order."""
 
 
-def _llm_classify_batch(claim: str, passages: list[str]) -> list[tuple[Stance, float]]:
-    """Classify every passage for a claim in a single LLM call."""
+def _llm_classify_batch(claim: str, passages: list[str]) -> list[tuple[Stance, float] | None]:
+    """
+    Classify every passage for a claim in a single LLM call.
+
+    A passage the model gave no usable answer for comes back as None rather than
+    NEUTRAL, so callers can tell "classified neutral" from "not classified" and
+    avoid caching a failure as if it were a result.
+    """
     from paper_dissector.llm import chat_json  # local import avoids an import cycle
 
-    neutral: list[tuple[Stance, float]] = [(Stance.NEUTRAL, 0.0)] * len(passages)
+    unclassified: list[tuple[Stance, float] | None] = [None] * len(passages)
     if not passages:
         return []
 
@@ -150,10 +156,10 @@ def _llm_classify_batch(claim: str, passages: list[str]) -> list[tuple[Stance, f
             temperature=0.0,
         )
     except Exception as exc:
-        log.warning("LLM stance fallback failed (%s); defaulting to NEUTRAL", exc)
-        return neutral
+        log.warning("LLM stance fallback failed (%s); defaulting to NEUTRAL, uncached", exc)
+        return unclassified
 
-    out = list(neutral)
+    out = list(unclassified)
     for row in parsed.get("results", []) or []:
         try:
             idx = int(row.get("index", 0)) - 1
@@ -190,6 +196,8 @@ def classify_stance(claim: str, passage: str) -> tuple[Stance, float]:
     result = _hf_classify(claim, passage)
     if result is None:
         result = _llm_classify_batch(claim, [passage])[0]
+    if result is None:
+        return Stance.NEUTRAL, 0.0     # a failure: not cached, so a later run retries
 
     cache.set(key, (result[0].value, result[1]))
     return result
@@ -232,6 +240,8 @@ def batch_classify(claim: str, passages: list[str]) -> list[tuple[Stance, float]
             claim, [(passages[i] or "")[:_MAX_PASSAGE_CHARS] for i in pending]
         )
         for slot, result in zip(pending, batch):
+            if result is None:
+                continue    # a failure: not cached, so a later run retries
             clipped = (passages[slot] or "")[:_MAX_PASSAGE_CHARS]
             cache.set(
                 cache.make_key("stance", [MODEL_ID, claim, clipped]),

@@ -197,6 +197,9 @@ Point the app at one directly for a demo:
 PD_ANALYSIS_JSON=analysis.json streamlit run app.py
 ```
 
+`demo/gelu_analysis.json` is a saved run on the GELU paper (arXiv 1606.08415)
+for this: `PD_ANALYSIS_JSON=demo/gelu_analysis.json streamlit run app.py`.
+
 Programmatically:
 
 ```python
@@ -312,11 +315,15 @@ paper-dissector/
 │       ├── pdf_parser.py           # Docling PDF → markdown + figures
 │       ├── literature.py           # Backend-agnostic literature search
 │       ├── openalex.py             # OpenAlex client (keyless, the default)
+│       ├── arxiv.py                # arXiv client (keyless, last in the fallback chain)
 │       ├── semantic_scholar.py     # Semantic Scholar client
 │       ├── _http.py                # Shared throttle/retry/cache/circuit breaker
 │       └── stance_classifier.py    # HuggingFace DeBERTa-v3 NLI + LLM fallback
 └── tests/
-    └── test_offline.py             # Regression checks needing no keys or network
+    ├── test_offline.py             # Regression checks needing no keys or network
+    ├── test_report_view.py         # Renders the Streamlit report headlessly
+    ├── test_real_run.py            # Regressions replayed from a real pipeline run
+    └── fixtures/                   # Output captured from a live run on the GELU paper
 ```
 
 ## Tests
