@@ -21,7 +21,6 @@ from openai import (
 from tenacity import (
     retry,
     retry_if_exception,
-    stop_after_attempt,
     wait_exponential,
 )
 
@@ -47,23 +46,97 @@ _TRANSIENT = (RateLimitError, APIConnectionError, APITimeoutError, InternalServe
 # A per-minute throttle clears on its own; a per-day cap does not. Retrying the
 # latter just burns minutes of backoff before failing anyway, so it is raised
 # straight away and the caller's fallback path takes over.
-_DAILY_QUOTA_MARKERS = (
-    "perday",
-    "per day",
-    "requests per day",
-    "free_tier_requests",
-    "resource_exhausted",
-)
+#
+# Gemini names the exhausted quota in the error, e.g.
+#   'quotaId': 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier'
+# and that is authoritative. Its generic wording ("free_tier_requests",
+# "RESOURCE_EXHAUSTED") appears on per-minute and per-day errors alike, so it
+# must not be read as a daily cap. Groq names no quotaId; its daily-cap errors
+# say "tokens per day (TPD)".
+_QUOTA_ID_RE = re.compile(r"""quotaId['"]?\s*:\s*['"]([A-Za-z0-9_-]+)""")
+_DAILY_QUOTA_MARKERS = ("perday", "per day")
+
+# A per-minute window can take up to a minute to clear.
+PER_MINUTE_QUOTA_WAIT = 60.0
+
+
+def _quota_ids(exc: BaseException) -> list[str]:
+    return _QUOTA_ID_RE.findall(str(exc))
+
+
+def _is_daily_quota(exc: BaseException) -> bool:
+    ids = _quota_ids(exc)
+    if ids:
+        return any("perday" in quota.lower() for quota in ids)
+    message = str(exc).lower()
+    return any(marker in message for marker in _DAILY_QUOTA_MARKERS)
+
+
+def _is_per_minute_quota(exc: BaseException) -> bool:
+    return any("perminute" in quota.lower() for quota in _quota_ids(exc))
 
 
 def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, RateLimitError):
-        message = str(exc).lower()
-        if any(marker in message for marker in _DAILY_QUOTA_MARKERS):
-            log.warning("daily quota exhausted, not retrying: %s", message[:160])
+        if _is_daily_quota(exc):
+            log.warning("daily quota exhausted, not retrying: %s", str(exc)[:160])
             return False
         return True
     return isinstance(exc, (APIConnectionError, APITimeoutError, InternalServerError))
+
+
+_backoff = wait_exponential(multiplier=2, min=2, max=60)
+
+# Rate limits clear with time, so they get more attempts than a failing
+# server does. Gemini 503s count against its request quota, so they get fewer.
+_RATE_LIMIT_ATTEMPTS = 8
+_OTHER_ATTEMPTS = 4
+
+
+def _retry_stop(retry_state) -> bool:
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    limit = _RATE_LIMIT_ATTEMPTS if isinstance(exc, RateLimitError) else _OTHER_ATTEMPTS
+    return retry_state.attempt_number >= limit
+
+
+_TRY_AGAIN_RE = re.compile(r"try again in (?:(\d+)m)?(\d+(?:\.\d+)?)s", re.IGNORECASE)
+
+
+def _server_retry_after(exc: BaseException) -> float | None:
+    """The wait a 429 asks for: Groq's retry-after header, or its "try again in 7.5s"."""
+    response = getattr(exc, "response", None)
+    header = response.headers.get("retry-after") if response is not None else None
+    try:
+        if header:
+            return float(header)
+    except ValueError:
+        pass
+    match = _TRY_AGAIN_RE.search(str(exc))
+    if match:
+        return int(match.group(1) or 0) * 60 + float(match.group(2))
+    return None
+
+
+def _retry_wait(retry_state) -> float:
+    """
+    Wait out a rate limit for as long as it asks; exponential backoff otherwise.
+
+    With the SDK's own retries disabled (config._SDK_RETRIES), this is the only
+    place that honours Groq's retry-after, which the SDK used to handle.
+    """
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if exc is not None and _is_per_minute_quota(exc):
+        delay = PER_MINUTE_QUOTA_WAIT
+    elif isinstance(exc, RateLimitError) and _server_retry_after(exc) is not None:
+        delay = min(_server_retry_after(exc) + 1.0, PER_MINUTE_QUOTA_WAIT + 5)
+    else:
+        delay = _backoff(retry_state)
+    if isinstance(exc, RateLimitError):
+        log.warning(
+            "rate limited (%s); retry %d in %.0fs",
+            ", ".join(_quota_ids(exc)) or "429", retry_state.attempt_number, delay,
+        )
+    return delay
 
 # Appended to the system prompt when we cannot use native JSON mode.
 _JSON_NUDGE = (
@@ -220,8 +293,8 @@ def _fit_to_budget(messages: list[dict], provider: str, budget: int | None = Non
 
 @retry(
     retry=retry_if_exception(_is_retryable),
-    wait=wait_exponential(multiplier=2, min=2, max=60),
-    stop=stop_after_attempt(5),
+    wait=_retry_wait,
+    stop=_retry_stop,
     reraise=True,
 )
 def _create(client, **kwargs):

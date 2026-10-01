@@ -7,7 +7,7 @@ import logging
 from paper_dissector.llm import chat_json
 from paper_dissector.sanitize import as_str_list, as_text, clamp01, coerce_enum
 from paper_dissector.schemas import (
-    Claim, ClaimVerdict, DebateTranscript, ExternalEvidenceResult,
+    AuditSeverity, Claim, ClaimVerdict, DebateTranscript, ExternalEvidenceResult,
     FinalReport, InternalAuditResult, VerdictLabel,
 )
 from paper_dissector.state import PaperState
@@ -55,7 +55,15 @@ HOW TO READ THE EVIDENCE — these mistakes invalidate a verdict:
 - Papers marked NEUTRAL bear on nothing. Do not read them as doubt.
 - The internal audit is the strongest evidence available, because it checks the
   claim against the paper's OWN data. If table_consistency is PASS, the claim's
-  numbers match the paper's tables, and that is substantial support.
+  numbers match the paper's own reported data (its tables, or its text where no
+  table reports them), and that is substantial support. Do not describe a
+  number as appearing in a table unless the audit says so.
+- visual_mismatch_detail is the vision model's reading of a figure. If it is
+  null, no figure was examined, so do not raise VISUAL_MISMATCH or any other
+  figure-based flag.
+- Raise STALE_BASELINE only if a staleness entry's verdict is STALE, never when
+  it says CURRENT. A number reported in the text but in no table is not a
+  table mismatch.
 - Cite only numbers that appear in the material you were given. Do not state a
   figure for a baseline unless it is in the audit, the evidence or the debate.
   An argument resting on a number you supplied yourself is worthless.
@@ -95,7 +103,7 @@ Respond ONLY with valid JSON:
   "verdict": "PARTIALLY_SUPPORTED",
   "confidence": 0.55,
   "justification": "2-3 sentence explanation",
-  "flags": ["STALE_BASELINE", "VISUAL_MISMATCH"],
+  "flags": ["NO_STATISTICAL_TESTS"],
   "prosecutor_strongest": "their best point in one line",
   "defender_strongest": "their best point in one line",
   "unresolved": ["list of points neither side settled"]
@@ -159,6 +167,56 @@ def _build_verdict(raw: dict, claim_id: str) -> ClaimVerdict:
     )
 
 
+def _has_vlm_reading(audit: InternalAuditResult | None) -> bool:
+    return bool(audit and audit.visual_mismatch_detail)
+
+
+def _is_visual_flag(flag: str) -> bool:
+    return "VISUAL" in flag or "FIGURE" in flag
+
+
+def ground_flags(
+    flags: list[str],
+    audit: InternalAuditResult | None,
+    evidence: ExternalEvidenceResult | None,
+) -> list[str]:
+    """
+    Keep only the judge's flags that the stage outputs actually back.
+
+    The judge is an LLM and raises flags from its reading of the debate, which
+    in real runs included VISUAL_MISMATCH for claims whose figure was never
+    looked at. Each rule here ties a flag to the stage output it asserts.
+    """
+    stale = any(
+        (s.verdict or "").strip().upper().startswith("STALE")
+        for s in (evidence.staleness_entries if evidence else [])
+    )
+    table_failed = bool(audit) and audit.table_consistency in (
+        AuditSeverity.FAIL, AuditSeverity.MISMATCH,
+    )
+    contradicted = bool(evidence and evidence.contradicting_papers)
+
+    kept: list[str] = []
+    for flag in flags:
+        reason = None
+        if _is_visual_flag(flag) and not _has_vlm_reading(audit):
+            reason = "no VLM reading exists for this claim"
+        elif "STALE" in flag and not stale:
+            reason = "the baseline check did not find the baseline stale"
+        elif "TABLE" in flag and ("MISMATCH" in flag or "INCONSIST" in flag) and not table_failed:
+            # Includes a number stated in the text but absent from any table:
+            # the audit downgrades that to WARN, since no table contradicts it.
+            reason = "the audit's table check did not fail"
+        elif "EXTERNAL" in flag and "CONTRADICT" in flag and not contradicted:
+            reason = "no retrieved paper contradicts the claim"
+        if reason:
+            log.info("dropping judge flag %s on %s: %s",
+                     flag, audit.claim_id if audit else "?", reason)
+            continue
+        kept.append(flag)
+    return kept
+
+
 def _degraded_verdict(claim_id: str, reason: str) -> ClaimVerdict:
     """Placeholder verdict so one failed adjudication doesn't drop a claim."""
     return ClaimVerdict(
@@ -185,7 +243,13 @@ def compile_report(state: PaperState, verdicts: list[ClaimVerdict]) -> FinalRepo
 
     systemic = []
     stale_count = sum(1 for v in verdicts if "STALE_BASELINE" in v.flags)
-    visual_count = sum(1 for v in verdicts if "VISUAL_MISMATCH" in v.flags)
+    # Only a claim whose figure the VLM actually read can count as a figure
+    # that fails to support the text.
+    audits = {a.claim_id: a for a in state.get("internal_audits") or []}
+    visual_count = sum(
+        1 for v in verdicts
+        if "VISUAL_MISMATCH" in v.flags and _has_vlm_reading(audits.get(v.claim_id))
+    )
     failed_count = sum(1 for v in verdicts if "ADJUDICATION_FAILED" in v.flags)
     if stale_count > 1:
         systemic.append(f"Paper relies on outdated baselines ({stale_count} claims affected)")
@@ -225,7 +289,11 @@ def adjudicate(state: PaperState) -> dict:
 
         try:
             parsed = chat_json("judge", JUDGE_SYSTEM, context, temperature=0.1)
-            verdicts.append(_build_verdict(parsed, claim.claim_id))
+            verdict = _build_verdict(parsed, claim.claim_id)
+            verdict.flags = ground_flags(
+                verdict.flags, audits.get(claim.claim_id), evidence.get(claim.claim_id),
+            )
+            verdicts.append(verdict)
         except Exception as exc:
             log.error("adjudication failed for %s: %s", claim.claim_id, exc)
             verdicts.append(_degraded_verdict(claim.claim_id, str(exc)[:200]))

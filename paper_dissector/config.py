@@ -28,21 +28,29 @@ def _require(key: str, provider: str, url: str) -> str:
 
 # Cached: the pipeline makes hundreds of calls and each OpenAI() instance
 # carries its own connection pool.
+#
+# max_retries=0: llm._create owns retrying. The SDK's own default of 2 retries
+# stacked under it, so every attempt was three requests. In a real run Gemini
+# answered six 503s and then a 429: those retries were spending the 5/minute
+# and 20/day request quota that the pipeline needs.
+_SDK_RETRIES = 0
 
 @lru_cache(maxsize=1)
 def get_gemini_client() -> OpenAI:
-    """Gemini 2.5 Flash — best free reasoning + vision. 500 req/day."""
+    """Gemini (GEMINI_MODEL) — large context + vision. Free tier: 20 req/day and 5 req/min per model."""
     return OpenAI(
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         api_key=_require("GEMINI_API_KEY", "Gemini", "https://aistudio.google.com/apikey"),
+        max_retries=_SDK_RETRIES,
     )
 
 @lru_cache(maxsize=1)
 def get_groq_client() -> OpenAI:
-    """Groq Llama 3.3 70B — fast inference. 14,400 req/day."""
+    """Groq (gpt-oss-120b, qwen3.8-27b) — fast inference. Free tier: 8000 tokens/min, 200k tokens/day."""
     return OpenAI(
         base_url="https://api.groq.com/openai/v1",
         api_key=_require("GROQ_API_KEY", "Groq", "https://console.groq.com/keys"),
+        max_retries=_SDK_RETRIES,
     )
 
 @lru_cache(maxsize=1)
@@ -51,6 +59,25 @@ def get_mistral_client() -> OpenAI:
     return OpenAI(
         base_url="https://api.mistral.ai/v1",
         api_key=_require("MISTRAL_API_KEY", "Mistral", "https://console.mistral.ai/api-keys"),
+        max_retries=_SDK_RETRIES,
+    )
+
+# Local models through Ollama's OpenAI-compatible endpoint. No key, no quota.
+# Ollama's default context is 4096 tokens and it ignores per-request context
+# settings, truncating longer prompts silently, so point roles at a model built
+# with a larger num_ctx (e.g. a Modelfile with PARAMETER num_ctx 12288) and keep
+# OLLAMA_INPUT_TOKEN_BUDGET below it.
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+
+
+@lru_cache(maxsize=1)
+def get_ollama_client() -> OpenAI:
+    """Ollama — local models, e.g. PD_AGENT_JUDGE_PROVIDER=ollama PD_AGENT_JUDGE_MODEL=qwen2.5:7b."""
+    return OpenAI(
+        base_url=OLLAMA_BASE_URL,
+        api_key="ollama",   # required by the client, ignored by Ollama
+        max_retries=_SDK_RETRIES,
+        timeout=float(os.getenv("OLLAMA_TIMEOUT", "900")),  # local generation can be slow
     )
 
 # ── Model names per provider ─────────────────────────────────────
@@ -89,6 +116,8 @@ INPUT_TOKEN_BUDGET = {
     "groq": int(os.getenv("GROQ_INPUT_TOKEN_BUDGET", "5200")),
     "gemini": int(os.getenv("GEMINI_INPUT_TOKEN_BUDGET", "200000")),
     "mistral": int(os.getenv("MISTRAL_INPUT_TOKEN_BUDGET", "24000")),
+    # Must stay under the Ollama model's num_ctx, leaving room for the reply.
+    "ollama": int(os.getenv("OLLAMA_INPUT_TOKEN_BUDGET", "9000")),
 }
 
 
@@ -152,7 +181,10 @@ def get_client_for_agent(agent_name: str) -> tuple[OpenAI, str]:
         "gemini": get_gemini_client,
         "groq": get_groq_client,
         "mistral": get_mistral_client,
+        "ollama": get_ollama_client,
     }
+    if provider not in factory:
+        raise ValueError(f"unknown provider {provider!r} for {agent_name}; use one of {sorted(factory)}")
     return factory[provider](), model
 
 # ── External APIs ────────────────────────────────────────────────
